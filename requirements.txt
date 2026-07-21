@@ -1,0 +1,11 @@
+requests
+urllib3
+PyQt6
+pyautogui
+pyperclip
+pillow
+opencv-python
+markdown
+pandas
+openpyxl
+python-vlc

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+hf_cache/
+debug_log.txt
+STARTUP_ERROR.txt
+CRITICAL_BOOT_FAILURE.txt
+SKIP_CHECK.txt
