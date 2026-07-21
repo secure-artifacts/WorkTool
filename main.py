@@ -2879,7 +2879,7 @@ def _pick_nonconflict_path(dst_path):
     # 极端兜底：回退到 uuid，避免死循环
     return os.path.join(base_dir, f"{stem_base}_{uuid.uuid4().hex[:6]}{ext}")
 
-def _silent_install_libs(libs, timeout=120, log_prefix="[ENV]"):
+def _silent_install_libs(libs, timeout=120, log_prefix="[ENV]", force_reinstall=False, extra_pip_args=None):
     """复用现有静默依赖安装逻辑，按 import 名输入。"""
     targets = [str(lib or "").strip() for lib in (libs or []) if str(lib or "").strip()]
     if not targets:
@@ -2895,7 +2895,14 @@ def _silent_install_libs(libs, timeout=120, log_prefix="[ENV]"):
     success = True
     for lib in targets:
         pkg = _normalize_pip_package_name(lib)
-        cmd = f'{py_exe_quoted} -m pip install --upgrade {pkg} --no-cache-dir'
+        extra_parts = [str(x).strip() for x in (extra_pip_args or []) if str(x).strip()]
+        pip_parts = ["install", "--upgrade"]
+        if force_reinstall:
+            pip_parts.append("--force-reinstall")
+        pip_parts.append("--no-cache-dir")
+        pip_parts.extend(extra_parts)
+        pip_parts.append(pkg)
+        cmd = f'{py_exe_quoted} -m pip {" ".join(pip_parts)}'
         try:
             creationflags = 0x08000000 if sys.platform == 'win32' else 0
             res = subprocess.run(cmd, shell=True, capture_output=True, text=True, creationflags=creationflags, timeout=max(30, int(timeout or 120)))
@@ -2921,6 +2928,144 @@ def _silent_install_libs(libs, timeout=120, log_prefix="[ENV]"):
         except Exception:
             pass
     return bool(success)
+
+def _purge_modules(module_prefixes):
+    """清理已加载模块，避免半初始化模块残留导致重复导入继续报错。"""
+    removed = []
+    prefixes = [str(x or "").strip() for x in (module_prefixes or []) if str(x or "").strip()]
+    if not prefixes:
+        return removed
+    for name in list(sys.modules.keys()):
+        for prefix in prefixes:
+            if name == prefix or name.startswith(prefix + "."):
+                removed.append(name)
+                sys.modules.pop(name, None)
+                break
+    return removed
+
+def _find_shadowing_paths(module_names, search_root=None):
+    """检测程序目录下是否存在会遮蔽三方库导入的同名文件/目录。"""
+    root = str(search_root or "").strip()
+    if not root or not os.path.isdir(root):
+        return []
+    hits = []
+    for name in [str(x or "").strip() for x in (module_names or []) if str(x or "").strip()]:
+        file_candidate = os.path.join(root, f"{name}.py")
+        dir_candidate = os.path.join(root, name)
+        if os.path.isfile(file_candidate):
+            hits.append(file_candidate)
+        if os.path.isdir(dir_candidate):
+            hits.append(dir_candidate)
+    return sorted(set(hits))
+
+def _validate_torch_runtime():
+    """验证 PyTorch 是否为可用的二进制扩展版本，而不是坏安装/路径污染。"""
+    try:
+        import importlib
+        torch = importlib.import_module("torch")
+        module_file = str(getattr(torch, "__file__", "") or "")
+        c_mod = getattr(torch, "_C", None)
+        if c_mod is None:
+            raise ImportError("torch._C 不存在，PyTorch C 扩展未成功加载。")
+        c_file = str(getattr(c_mod, "__file__", "") or "")
+        if c_file and os.path.isdir(c_file):
+            raise ImportError(f"torch._C 指向了目录而不是二进制扩展: {c_file}")
+        _ = torch.tensor([0.0]).sum().item()
+        cuda_available = False
+        try:
+            cuda_available = bool(torch.cuda.is_available())
+        except Exception:
+            pass
+        return True, {
+            "module_file": module_file,
+            "c_file": c_file,
+            "version": str(getattr(torch, "__version__", "") or ""),
+            "cuda_available": cuda_available,
+        }
+    except Exception as e:
+        return False, {"error": str(e)}
+
+def _validate_transformers_runtime():
+    """验证 transformers + safetensors 基础栈是否可导入。"""
+    try:
+        import importlib
+        transformers = importlib.import_module("transformers")
+        safetensors = importlib.import_module("safetensors")
+        return True, {
+            "transformers_version": str(getattr(transformers, "__version__", "") or ""),
+            "safetensors_file": str(getattr(safetensors, "__file__", "") or ""),
+        }
+    except Exception as e:
+        return False, {"error": str(e)}
+
+def _validate_sentence_transformers_runtime():
+    """验证 sentence-transformers 路径是否健康，同时显式检查 regex C 扩展。"""
+    try:
+        import importlib
+        regex = importlib.import_module("regex")
+        importlib.import_module("regex._regex")
+        _ = regex.compile(r"\w+")
+        st = importlib.import_module("sentence_transformers")
+        return True, {
+            "regex_file": str(getattr(regex, "__file__", "") or ""),
+            "sentence_transformers_version": str(getattr(st, "__version__", "") or ""),
+        }
+    except Exception as e:
+        return False, {"error": str(e)}
+
+def _validate_cn_clip_runtime():
+    """验证 cn_clip 是否可导入。"""
+    try:
+        import importlib
+        clip_mod = importlib.import_module("cn_clip.clip")
+        return True, {"module_file": str(getattr(clip_mod, "__file__", "") or "")}
+    except Exception as e:
+        return False, {"error": str(e)}
+
+def _ensure_runtime_packages(pip_libs, validator, module_prefixes, log_fn=None, label="运行时依赖", timeout=600, force_reinstall=False, extra_pip_args=None):
+    """运行时健康检查 + 自动修复。"""
+    ok, info = validator()
+    if ok:
+        return True, info
+    if callable(log_fn):
+        detail = str((info or {}).get("error", "") or "").strip()
+        if detail:
+            log_fn(f"🩹 检测到 {label} 异常，正在自动修复：{detail}", "orange")
+        else:
+            log_fn(f"🩹 检测到 {label} 异常，正在自动修复...", "orange")
+    _purge_modules(module_prefixes)
+    try:
+        importlib.invalidate_caches()
+    except Exception:
+        pass
+    installed = _silent_install_libs(
+        pip_libs,
+        timeout=timeout,
+        log_prefix=f"[{label}]",
+        force_reinstall=force_reinstall,
+        extra_pip_args=extra_pip_args,
+    )
+    _purge_modules(module_prefixes)
+    try:
+        importlib.invalidate_caches()
+    except Exception:
+        pass
+    repaired_ok, repaired_info = validator()
+    return bool(installed and repaired_ok), repaired_info if repaired_ok else repaired_info or info
+
+def _normalize_clip_model_name(model_name):
+    default_name = "OFA-Sys/chinese-clip-vit-large-patch14"
+    raw_name = (model_name or default_name).strip() or default_name
+    alias_map = {
+        "clip-ViT-L-14": "openai/clip-vit-large-patch14",
+        "clip-ViT-B-16": "openai/clip-vit-base-patch16",
+        "clip-ViT-B-32": "openai/clip-vit-base-patch32",
+    }
+    return alias_map.get(raw_name, raw_name), raw_name
+
+def _is_cn_clip_model_name(model_name):
+    name = str(model_name or "").strip().lower()
+    return ("chinese-clip" in name) or ("cn-clip" in name) or name.startswith("ofa-sys/")
 
 def silent_env_check():
     """Check and install only core runtime packages at startup; heavy AI packages stay on-demand."""
@@ -5334,9 +5479,57 @@ class ClipFastMatchThread(QThread):
         normalized_name = (model_name or default_chinese_clip).strip()
         if not normalized_name:
             normalized_name = default_chinese_clip
+        normalized_name, original_name = _normalize_clip_model_name(normalized_name)
+        if original_name != normalized_name:
+            log_fn(f"ℹ️ CLIP 模型别名已自动映射：{original_name} -> {normalized_name}", "gray")
 
         if cls._clip_model is not None and cls._clip_model_name == normalized_name:
             return cls._clip_model
+
+        shadow_hits = _find_shadowing_paths(["torch", "regex", "transformers", "cn_clip"], search_root=base_dir)
+        if shadow_hits:
+            hit_text = "；".join(os.path.basename(p) for p in shadow_hits[:6])
+            log_fn(f"⚠️ 程序目录中发现可能干扰导入的同名文件/目录：{hit_text}", "orange")
+
+        _purge_modules(["torch", "functorch", "torchvision", "transformers", "safetensors", "sentence_transformers", "regex", "cn_clip"])
+        try:
+            importlib.invalidate_caches()
+        except Exception:
+            pass
+
+        torch_ready, torch_info = _ensure_runtime_packages(
+            ["torch", "torchvision"],
+            _validate_torch_runtime,
+            ["torch", "functorch", "torchvision"],
+            log_fn=log_fn,
+            label="PyTorch 运行时",
+            timeout=2400,
+            force_reinstall=True,
+        )
+        if not torch_ready:
+            detail = str((torch_info or {}).get("error", "") or "未知错误").strip()
+            raise RuntimeError(
+                "CLIP 运行环境修复失败：PyTorch 仍不可用。\n"
+                f"原因：{detail}\n"
+                "建议：确认网络可用，并使用当前程序自带的 Python 重新安装 torch / torchvision。"
+            )
+
+        tf_stack_ready, tf_stack_info = _ensure_runtime_packages(
+            ["transformers", "safetensors"],
+            _validate_transformers_runtime,
+            ["transformers", "safetensors"],
+            log_fn=log_fn,
+            label="Transformers 运行时",
+            timeout=1800,
+            force_reinstall=True,
+        )
+        if not tf_stack_ready:
+            detail = str((tf_stack_info or {}).get("error", "") or "未知错误").strip()
+            raise RuntimeError(
+                "CLIP 运行环境修复失败：Transformers 依赖仍不可用。\n"
+                f"原因：{detail}\n"
+                "建议：确认网络可用，并重新安装 transformers / safetensors。"
+            )
 
         device = "cpu"
         if use_gpu:
@@ -5354,24 +5547,7 @@ class ClipFastMatchThread(QThread):
         st_load_error = None
         tf_load_error = None
         try:
-            # 优先尝试使用 sentence-transformers 加载 Hugging Face 模型
-            from sentence_transformers import SentenceTransformer
-            log_fn(f"⏳ 正在加载 CLIP 模型: {normalized_name}（首次需下载，后续将直接从缓存读取）", "blue")
-            cls._clip_model = SentenceTransformer(normalized_name, device=device)
-            cls._clip_model_name = normalized_name
-            log_fn(f"✅ CLIP 模型加载完成 (device={device})", "green")
-            return cls._clip_model
-        except Exception as e:
-            st_load_error = e
-            msg = str(e)
-            if ("upgrade torch to at least v2.6" in msg) or ("CVE-2025-32434" in msg):
-                log_fn(f"⚠️ sentence-transformers 因 PyTorch 版本安全限制拒绝加载（{e}）", "orange")
-                log_fn("💡 解决思路：升级 torch>=2.6，或改用 Transformers(优先 safetensors) / cn_clip 加载。", "gray")
-            else:
-                log_fn(f"⚠️ sentence-transformers 加载失败 ({e})", "orange")
-
-        # 备选：直接使用 Transformers 加载 CLIP（优先 safetensors，绕开 sentence-transformers 的版本限制）
-        try:
+            # 优先走更稳定的 Transformers 直连方案，避免新环境下 sentence-transformers + regex 的额外脆弱性。
             import torch
             log_fn("🔄 尝试使用 Transformers 直接加载 CLIP（优先 safetensors）...", "gray")
             # Windows + pythonw 场景下，sys.stdout/sys.stderr 可能为 None，
@@ -5387,16 +5563,37 @@ class ClipFastMatchThread(QThread):
             # 关闭 Hub 进度条（避免触发终端相关判断）
             os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
             os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-            from transformers import CLIPModel, CLIPProcessor
+            from transformers import AutoModel, AutoProcessor, CLIPModel, CLIPProcessor
 
             # device 字符串 -> torch.device
             torch_device = torch.device(device)
-            # 优先使用 safetensors；如果仓库没有 safetensors，则自动回退到 .bin 权重
-            try:
-                clip_model = CLIPModel.from_pretrained(normalized_name, use_safetensors=True)
-            except Exception:
-                clip_model = CLIPModel.from_pretrained(normalized_name, use_safetensors=False)
-            clip_processor = CLIPProcessor.from_pretrained(normalized_name)
+
+            def _load_hf_model(model_id):
+                last_error = None
+                for loader_name, loader_cls in (("AutoModel", AutoModel), ("CLIPModel", CLIPModel)):
+                    for use_safetensors in (True, False):
+                        try:
+                            return loader_cls.from_pretrained(model_id, use_safetensors=use_safetensors)
+                        except TypeError:
+                            try:
+                                return loader_cls.from_pretrained(model_id)
+                            except Exception as inner_e:
+                                last_error = inner_e
+                        except Exception as inner_e:
+                            last_error = inner_e
+                raise last_error or RuntimeError("无法加载 Hugging Face 模型")
+
+            def _load_hf_processor(model_id):
+                last_error = None
+                for loader_name, loader_cls in (("AutoProcessor", AutoProcessor), ("CLIPProcessor", CLIPProcessor)):
+                    try:
+                        return loader_cls.from_pretrained(model_id)
+                    except Exception as inner_e:
+                        last_error = inner_e
+                raise last_error or RuntimeError("无法加载 Hugging Face Processor")
+
+            clip_model = _load_hf_model(normalized_name)
+            clip_processor = _load_hf_processor(normalized_name)
             clip_model.eval().to(torch_device)
 
             class TransformersClipAdapter:
@@ -5505,75 +5702,114 @@ class ClipFastMatchThread(QThread):
             return cls._clip_model
         except Exception as e:
             tf_load_error = e
-            log_fn(f"⚠️ Transformers 加载失败 ({e})，尝试使用 cn_clip 官方库加载...", "orange")
+            log_fn(f"⚠️ Transformers 加载失败 ({e})", "orange")
 
-        # 如果 sentence-transformers 加载失败，尝试 cn_clip 官方库
-        try:
-            import torch
+        cn_e = "已跳过（当前模型不是 CN-CLIP 系列）"
+        if _is_cn_clip_model_name(normalized_name):
             try:
+                cn_ready, cn_info = _ensure_runtime_packages(
+                    ["cn_clip"],
+                    _validate_cn_clip_runtime,
+                    ["cn_clip"],
+                    log_fn=log_fn,
+                    label="CN-CLIP 运行时",
+                    timeout=1800,
+                    force_reinstall=False,
+                )
+                if not cn_ready:
+                    raise ImportError(str((cn_info or {}).get("error", "") or "cn_clip 自动修复失败"))
+
+                import torch
                 import cn_clip.clip as clip
                 from cn_clip.clip import load_from_name
-            except ImportError:
-                log_fn("📦 检测到 cn_clip 缺失，正在自动安装 cn-clip...", "blue")
-                if not _silent_install_libs(["cn_clip"], timeout=1800, log_prefix="[CN-CLIP]"):
-                    raise ImportError("缺失 cn_clip 库，且自动安装失败。")
-                import importlib
-                importlib.invalidate_caches()
-                import cn_clip.clip as clip
-                from cn_clip.clip import load_from_name
 
-            model_short_name = normalized_name.split("/")[-1].replace("chinese-clip-", "").upper()
-            # 适配 cn_clip 官方库的模型名称
-            if model_short_name == "VIT-L-14": model_short_name = "ViT-L-14"
-            elif model_short_name == "VIT-H-14": model_short_name = "ViT-H-14"
-            elif model_short_name == "VIT-B-16": model_short_name = "ViT-B-16"
-            elif model_short_name == "RN50": model_short_name = "RN50"
-            else: model_short_name = "ViT-L-14" # 默认一个，确保能加载
+                model_short_name = normalized_name.split("/")[-1].replace("chinese-clip-", "").upper()
+                # 适配 cn_clip 官方库的模型名称
+                if model_short_name == "VIT-L-14":
+                    model_short_name = "ViT-L-14"
+                elif model_short_name == "VIT-H-14":
+                    model_short_name = "ViT-H-14"
+                elif model_short_name == "VIT-B-16":
+                    model_short_name = "ViT-B-16"
+                elif model_short_name == "VIT-B-32":
+                    model_short_name = "ViT-B-32"
+                elif model_short_name == "RN50":
+                    model_short_name = "RN50"
+                else:
+                    model_short_name = "ViT-L-14"
 
-            # 尝试从 ModelScope 自动下载
-            log_fn(f"⏳ 正在加载 CN-CLIP 模型: {model_short_name}（首次需下载，后续将直接从缓存读取）", "blue")
-            # 使用 download_root 和 use_modelscope=True 确保自动下载
-            model, preprocess = load_from_name(model_short_name, device=device, download_root=os.environ["HF_HOME"], use_modelscope=True)
+                # 尝试从 ModelScope 自动下载
+                log_fn(f"⏳ 正在加载 CN-CLIP 模型: {model_short_name}（首次需下载，后续将直接从缓存读取）", "blue")
+                model, preprocess = load_from_name(model_short_name, device=device, download_root=os.environ["HF_HOME"], use_modelscope=True)
 
-            class CnClipAdapter:
-                def __init__(self, model, preprocess, device):
-                    self.model = model.eval().to(device)
-                    self.preprocess = preprocess
-                    self.device = device
+                class CnClipAdapter:
+                    def __init__(self, model, preprocess, device):
+                        self.model = model.eval().to(device)
+                        self.preprocess = preprocess
+                        self.device = device
 
-                def encode(self, sentences, batch_size=32, show_progress_bar=False, convert_to_numpy=True):
-                    from PIL import Image
-                    import numpy as np
-                    import torch
+                    def encode(self, sentences, batch_size=32, show_progress_bar=False, convert_to_numpy=True):
+                        from PIL import Image
+                        import numpy as np
+                        import torch
 
-                    if isinstance(sentences[0], Image.Image):
-                        processed_images = torch.stack([self.preprocess(img) for img in sentences]).to(self.device)
-                        with torch.no_grad():
-                            features = self.model.encode_image(processed_images)
-                    else:
-                        tokenized_texts = clip.tokenize(sentences).to(self.device)
-                        with torch.no_grad():
-                            features = self.model.encode_text(tokenized_texts)
-                    features /= features.norm(dim=-1, keepdim=True)
-                    return features.cpu().numpy() if convert_to_numpy else features
+                        if isinstance(sentences[0], Image.Image):
+                            processed_images = torch.stack([self.preprocess(img) for img in sentences]).to(self.device)
+                            with torch.no_grad():
+                                features = self.model.encode_image(processed_images)
+                        else:
+                            tokenized_texts = clip.tokenize(sentences).to(self.device)
+                            with torch.no_grad():
+                                features = self.model.encode_text(tokenized_texts)
+                        features /= features.norm(dim=-1, keepdim=True)
+                        return features.cpu().numpy() if convert_to_numpy else features
 
-            cls._clip_model = CnClipAdapter(model, preprocess, device)
-            cls._clip_model_name = normalized_name
-            log_fn(f"✅ CN-CLIP 模型加载完成 (device={device})", "green")
-            return cls._clip_model
-        except Exception as cn_e:
-            final_error_msg = (
-                "CLIP 模型加载失败：\n"
-                f"  - sentence-transformers 尝试失败: {st_load_error}\n"
-                f"  - transformers 尝试失败: {tf_load_error}\n"
-                f"  - cn_clip 尝试失败: {cn_e}\n"
-                "建议按优先级排查：\n"
-                "  1) 安装/更新 safetensors + transformers（优先使用 safetensors 权重）\n"
-                "  2) 或安装 cn_clip 作为兜底（pip install cn_clip）\n"
-                "  3) 最后再考虑升级 torch>=2.6\n"
-                "并确认模型名称正确。"
+                cls._clip_model = CnClipAdapter(model, preprocess, device)
+                cls._clip_model_name = normalized_name
+                log_fn(f"✅ CN-CLIP 模型加载完成 (device={device})", "green")
+                return cls._clip_model
+            except Exception as e:
+                cn_e = e
+                log_fn(f"⚠️ CN-CLIP 加载失败 ({e})", "orange")
+
+        try:
+            st_ready, st_info = _ensure_runtime_packages(
+                ["regex", "sentence_transformers"],
+                _validate_sentence_transformers_runtime,
+                ["regex", "sentence_transformers"],
+                log_fn=log_fn,
+                label="sentence-transformers 运行时",
+                timeout=1800,
+                force_reinstall=True,
             )
-            raise RuntimeError(final_error_msg)
+            if not st_ready:
+                raise ImportError(str((st_info or {}).get("error", "") or "sentence-transformers 自动修复失败"))
+            from sentence_transformers import SentenceTransformer
+            log_fn(f"⏳ 正在使用 sentence-transformers 回退加载 CLIP: {normalized_name}", "gray")
+            cls._clip_model = SentenceTransformer(normalized_name, device=device)
+            cls._clip_model_name = normalized_name
+            log_fn(f"✅ sentence-transformers 回退加载完成 (device={device})", "green")
+            return cls._clip_model
+        except Exception as e:
+            st_load_error = e
+
+        shadow_hint = ""
+        if shadow_hits:
+            shadow_hint = "\n  - 导入遮蔽风险: 程序目录存在与三方库同名的文件/目录，请改名后重试。"
+        final_error_msg = (
+            "CLIP 模型加载失败：\n"
+            f"  - transformers 尝试失败: {tf_load_error}\n"
+            f"  - cn_clip 尝试失败: {cn_e}\n"
+            f"  - sentence-transformers 尝试失败: {st_load_error}"
+            f"{shadow_hint}\n"
+            "已自动执行运行时修复，但仍未恢复。\n"
+            "建议按优先级排查：\n"
+            "  1) 确认当前程序目录下没有 torch.py / regex.py / transformers.py 或同名文件夹\n"
+            "  2) 确认网络正常，让程序自动完成 torch / transformers / safetensors 安装\n"
+            "  3) 若仍失败，再手动重建虚拟环境并重装依赖\n"
+            "  4) 最后确认模型名称是否正确"
+        )
+        raise RuntimeError(final_error_msg)
 
     @classmethod
     def clear_cache(cls):
