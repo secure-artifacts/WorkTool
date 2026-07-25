@@ -13949,6 +13949,11 @@ class VideoConcatTab(QWidget):
         self.concat_include_single_folder_check.setToolTip("勾选后，智能组合时只有 1 个视频的文件夹也会生成任务，执行时直接整理到输出目录")
         self.concat_include_single_folder_check.toggled.connect(self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit)
         table_top_btns.addWidget(self.concat_include_single_folder_check)
+        self.concat_skip_incomplete_folder_check = QCheckBox("缺失同名 txt 视频时跳过文件夹")
+        self.concat_skip_incomplete_folder_check.setChecked(False)
+        self.concat_skip_incomplete_folder_check.setToolTip("勾选后，会先检查文件夹内的 txt 是否都有同名视频；若存在缺失素材，则该文件夹不会生成拼接任务")
+        self.concat_skip_incomplete_folder_check.toggled.connect(self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit)
+        table_top_btns.addWidget(self.concat_skip_incomplete_folder_check)
         table_top_btns.addStretch()
         rule_layout.addLayout(table_top_btns)
 
@@ -16466,26 +16471,72 @@ class VideoConcatTab(QWidget):
         check = getattr(self, "concat_include_single_folder_check", None)
         return bool(check and check.isChecked())
 
+    def _concat_skip_incomplete_folder_enabled(self):
+        check = getattr(self, "concat_skip_incomplete_folder_check", None)
+        return bool(check and check.isChecked())
+
+    def _find_missing_txt_video_pairs(self, folder):
+        if not folder or not os.path.isdir(folder):
+            return []
+        try:
+            entries = os.listdir(folder)
+        except Exception:
+            return []
+        video_stems = set()
+        txt_stems = set()
+        for name in entries:
+            full_path = os.path.join(folder, name)
+            if not os.path.isfile(full_path):
+                continue
+            stem, ext = os.path.splitext(name)
+            ext_lower = ext.lower()
+            if ext_lower in self.VIDEO_EXTS:
+                video_stems.add(stem.lower())
+            elif ext_lower == ".txt":
+                txt_stems.add(stem.lower())
+        missing = [stem for stem in txt_stems if stem not in video_stems]
+        return sorted(missing, key=self._natural_sort_key)
+
     def auto_fill_concat_groups_by_folder(self):
         videos = self._collect_videos()
         if not videos:
             QMessageBox.warning(self, "提示", "请先添加至少 1 个有效视频素材")
             return
         allow_single = self._concat_allow_single_video_output()
+        skip_incomplete = self._concat_skip_incomplete_folder_enabled()
         folder_groups = {}
         for path in videos:
             folder = os.path.dirname(path)
             folder_groups.setdefault(folder, []).append(path)
         valid_groups = []
         single_group_count = 0
+        skipped_incomplete = []
         for folder, paths in folder_groups.items():
             ordered = sorted(paths, key=self._natural_sort_key)
+            if skip_incomplete:
+                missing_stems = self._find_missing_txt_video_pairs(folder)
+                if missing_stems:
+                    skipped_incomplete.append((folder, missing_stems))
+                    continue
             if len(ordered) >= 2 or (allow_single and len(ordered) == 1):
                 valid_groups.append((folder, ordered))
                 if len(ordered) == 1:
                     single_group_count += 1
         valid_groups.sort(key=lambda item: self._natural_sort_key(item[0]))
         if not valid_groups:
+            if skipped_incomplete:
+                sample_lines = []
+                for folder, missing_stems in skipped_incomplete[:5]:
+                    sample_lines.append(f"{os.path.basename(folder) or folder}：缺少 {', '.join(missing_stems[:5])}")
+                extra = "\n".join(sample_lines)
+                if len(skipped_incomplete) > 5:
+                    extra += "\n……"
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    f"没有生成可用的拼接任务：共跳过 {len(skipped_incomplete)} 个素材不完整的文件夹。\n{extra}"
+                )
+                return
             if allow_single:
                 QMessageBox.warning(self, "提示", "没有找到可自动整理的文件夹组，请先确认视频素材是否有效。")
             else:
@@ -16520,13 +16571,17 @@ class VideoConcatTab(QWidget):
         table.blockSignals(False)
         self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit()
         if single_group_count:
-            QMessageBox.information(
-                self,
-                "智能组合完成",
-                f"已按文件夹顺序生成 {len(valid_groups)} 组任务，其中 {single_group_count} 组为单视频，将在执行时直接整理到输出目录。"
-            )
+            msg = f"已按文件夹顺序生成 {len(valid_groups)} 组任务，其中 {single_group_count} 组为单视频，将在执行时直接整理到输出目录。"
         else:
-            QMessageBox.information(self, "智能组合完成", f"已按文件夹顺序生成 {len(valid_groups)} 组拼接任务。")
+            msg = f"已按文件夹顺序生成 {len(valid_groups)} 组拼接任务。"
+        if skipped_incomplete:
+            sample_lines = []
+            for folder, missing_stems in skipped_incomplete[:5]:
+                sample_lines.append(f"{os.path.basename(folder) or folder}：缺少 {', '.join(missing_stems[:5])}")
+            msg += f"\n\n另外已跳过 {len(skipped_incomplete)} 个素材不完整的文件夹：\n" + "\n".join(sample_lines)
+            if len(skipped_incomplete) > 5:
+                msg += "\n……"
+        QMessageBox.information(self, "智能组合完成", msg)
 
     def _build_video_refs(self, videos):
         refs = {
@@ -25248,8 +25303,82 @@ class FileManagerPro(QMainWindow):
         self.trigger_save()
 
     def setup_renamer_tab(self):
-        layout = QVBoxLayout(self.renamer_tab); tool_layout = QHBoxLayout(); tool_layout.addWidget(QLabel("查找:")); self.find_input = QLineEdit(); tool_layout.addWidget(self.find_input); tool_layout.addWidget(QLabel("替换:")); self.replace_input = QLineEdit(); tool_layout.addWidget(self.replace_input); self.regex_check = QCheckBox("正则"); tool_layout.addWidget(self.regex_check); btn_replace = QPushButton("替换"); btn_replace.clicked.connect(self.renamer_batch_replace); tool_layout.addWidget(btn_replace); layout.addLayout(tool_layout)
-        num_layout = QHBoxLayout(); num_layout.addWidget(QLabel("前删:")); self.del_front_spin = QSpinBox(); num_layout.addWidget(self.del_front_spin); btn_del_f = QPushButton("执行"); btn_del_f.clicked.connect(self.renamer_del_front); num_layout.addWidget(btn_del_f); num_layout.addSpacing(10); num_layout.addWidget(QLabel("后删:")); self.del_back_spin = QSpinBox(); num_layout.addWidget(self.del_back_spin); btn_del_b = QPushButton("执行"); btn_del_b.clicked.connect(self.renamer_del_back); num_layout.addWidget(btn_del_b); num_layout.addStretch(); btn_num = QPushButton("🔢 自动编号"); btn_num.clicked.connect(self.renamer_auto_number); num_layout.addWidget(btn_num); btn_restore = QPushButton("↩️ 还原"); btn_restore.clicked.connect(self.renamer_restore_original); num_layout.addWidget(btn_restore); self.btn_undo_rename = QPushButton("撤回上次改名"); self.btn_undo_rename.setEnabled(False); self.btn_undo_rename.clicked.connect(self.run_undo_rename); num_layout.addWidget(self.btn_undo_rename); btn_clear = QPushButton("🗑️ 清空"); btn_clear.clicked.connect(self.renamer_clear); num_layout.addWidget(btn_clear); layout.addLayout(num_layout)
+        layout = QVBoxLayout(self.renamer_tab)
+
+        direct_tip = QLabel(
+            "可直接拖拽文件/文件夹到下方表格，也可以用按钮添加；不需要先走 CSV 匹配。"
+            "表格已拆成前缀 / 主文件名 / 后缀 / 扩展名，改名时会分别组合，避免误改后缀。"
+        )
+        direct_tip.setWordWrap(True)
+        direct_tip.setStyleSheet("color:#1d4ed8; background:#eff6ff; padding:8px; border-radius:6px;")
+        layout.addWidget(direct_tip)
+
+        source_layout = QHBoxLayout()
+        btn_add_files = QPushButton("添加文件")
+        btn_add_files.clicked.connect(self.renamer_pick_files)
+        source_layout.addWidget(btn_add_files)
+        btn_add_folder = QPushButton("添加文件夹")
+        btn_add_folder.clicked.connect(self.renamer_pick_folder)
+        source_layout.addWidget(btn_add_folder)
+        source_layout.addStretch()
+        layout.addLayout(source_layout)
+
+        tool_layout = QHBoxLayout()
+        tool_layout.addWidget(QLabel("查找:"))
+        self.find_input = QLineEdit()
+        tool_layout.addWidget(self.find_input)
+        tool_layout.addWidget(QLabel("替换:"))
+        self.replace_input = QLineEdit()
+        tool_layout.addWidget(self.replace_input)
+        self.regex_check = QCheckBox("正则")
+        tool_layout.addWidget(self.regex_check)
+        btn_replace = QPushButton("替换")
+        btn_replace.clicked.connect(self.renamer_batch_replace)
+        tool_layout.addWidget(btn_replace)
+        tool_layout.addSpacing(12)
+        tool_layout.addWidget(QLabel("添加字段:"))
+        self.renamer_insert_text_input = QLineEdit()
+        self.renamer_insert_text_input.setPlaceholderText("例如：项目A / 成片 / 202607")
+        tool_layout.addWidget(self.renamer_insert_text_input)
+        tool_layout.addWidget(QLabel("添加到:"))
+        self.renamer_insert_pos_combo = QComboBox()
+        self.renamer_insert_pos_combo.addItems(["前缀", "后缀"])
+        tool_layout.addWidget(self.renamer_insert_pos_combo)
+        btn_insert_text = QPushButton("应用")
+        btn_insert_text.clicked.connect(self.renamer_apply_insert_text)
+        tool_layout.addWidget(btn_insert_text)
+        layout.addLayout(tool_layout)
+
+        num_layout = QHBoxLayout()
+        num_layout.addWidget(QLabel("前删:"))
+        self.del_front_spin = QSpinBox()
+        num_layout.addWidget(self.del_front_spin)
+        btn_del_f = QPushButton("执行")
+        btn_del_f.clicked.connect(self.renamer_del_front)
+        num_layout.addWidget(btn_del_f)
+        num_layout.addSpacing(10)
+        num_layout.addWidget(QLabel("后删:"))
+        self.del_back_spin = QSpinBox()
+        num_layout.addWidget(self.del_back_spin)
+        btn_del_b = QPushButton("执行")
+        btn_del_b.clicked.connect(self.renamer_del_back)
+        num_layout.addWidget(btn_del_b)
+        num_layout.addStretch()
+        btn_num = QPushButton("🔢 自动编号")
+        btn_num.clicked.connect(self.renamer_auto_number)
+        num_layout.addWidget(btn_num)
+        btn_restore = QPushButton("↩️ 还原")
+        btn_restore.clicked.connect(self.renamer_restore_original)
+        num_layout.addWidget(btn_restore)
+        self.btn_undo_rename = QPushButton("撤回上次改名")
+        self.btn_undo_rename.setEnabled(False)
+        self.btn_undo_rename.clicked.connect(self.run_undo_rename)
+        num_layout.addWidget(self.btn_undo_rename)
+        btn_clear = QPushButton("🗑️ 清空")
+        btn_clear.clicked.connect(self.renamer_clear)
+        num_layout.addWidget(btn_clear)
+        layout.addLayout(num_layout)
+
         # 智能改名区域
         smart_rename_group = QGroupBox("智能改名 (通过 CSV 匹配)"); smart_rename_layout = QVBoxLayout(smart_rename_group)
         
@@ -25261,7 +25390,22 @@ class FileManagerPro(QMainWindow):
         layout.addWidget(smart_rename_group)
 
         # 原有的批量重命名 UI
-        self.rename_table = ExcelTable(0, 3); self.rename_table.setObjectName("rename_table"); self.rename_table.setHorizontalHeaderLabels(["原始路径", "前缀", "主文件名"]); self.rename_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.rename_table); btn_exec_layout = QHBoxLayout(); self.ext_check = QCheckBox("包含后缀名"); self.ext_check.toggled.connect(self.renamer_toggle_ext); btn_exec_layout.addWidget(self.ext_check); btn_exec_layout.addStretch(); btn_exec = QPushButton(" 🚀 执行重命名 "); btn_exec.setObjectName("action_btn"); btn_exec.clicked.connect(self.renamer_execute); btn_exec_layout.addWidget(btn_exec); layout.addLayout(btn_exec_layout)
+        self.rename_table = ExcelTable(0, 5)
+        self.rename_table.setObjectName("rename_table")
+        self.rename_table.setHorizontalHeaderLabels(["原始路径", "前缀", "主文件名", "后缀", "扩展名"])
+        self.rename_table.horizontalHeader().setStretchLastSection(False)
+        self.rename_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch if PYQT_VERSION == 6 else QHeaderView.Stretch)
+        for col in (1, 2, 3, 4):
+            self.rename_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents if PYQT_VERSION == 6 else QHeaderView.ResizeToContents)
+        layout.addWidget(self.rename_table)
+        btn_exec_layout = QHBoxLayout()
+        btn_exec_layout.addWidget(QLabel("说明：前缀/主文件名/后缀会自动拼成新文件名，扩展名单独控制。"))
+        btn_exec_layout.addStretch()
+        btn_exec = QPushButton(" 🚀 执行重命名 ")
+        btn_exec.setObjectName("action_btn")
+        btn_exec.clicked.connect(self.renamer_execute)
+        btn_exec_layout.addWidget(btn_exec)
+        layout.addLayout(btn_exec_layout)
     def _get_browse_start_dir(self, line_edit=None):
         """浏览目录/文件时，优先从当前输入框已有路径打开，其次回退到上次浏览位置。"""
         candidates = []
@@ -26479,6 +26623,31 @@ class FileManagerPro(QMainWindow):
             return f"{prefix}-{main}"
         return prefix or main
 
+    def _compose_renamer_full_stem(self, prefix_text, main_text, suffix_text=""):
+        base = self._compose_renamer_stem(prefix_text, main_text)
+        suffix = (suffix_text or "").strip()
+        if base and suffix:
+            return f"{base}-{suffix}"
+        return base or suffix
+
+    def _normalize_renamer_ext(self, ext_text, original_ext=""):
+        raw = str(ext_text or "").strip()
+        if not raw:
+            return original_ext or ""
+        raw = raw.replace("。", ".").replace("．", ".").strip()
+        if raw.startswith("."):
+            return raw
+        return "." + raw.lstrip(".")
+
+    def _split_renamer_filename(self, file_path):
+        fname = os.path.basename(file_path or "")
+        stem, ext = os.path.splitext(fname)
+        return "", stem, "", ext.lstrip(".")
+
+    def _renamer_item_text(self, row, col):
+        item = self.rename_table.item(row, col)
+        return item.text().strip() if item else ""
+
     def _find_best_rename_code_match(self, name_without_ext, csv_mapping):
         """
         从文件名中寻找最合适的代码匹配：
@@ -26581,8 +26750,10 @@ class FileManagerPro(QMainWindow):
                     row = self.rename_table.rowCount()
                     self.rename_table.insertRow(row)
                     self.rename_table.setItem(row, 0, QTableWidgetItem(original_path))
-                    self.rename_table.setItem(row, 1, QTableWidgetItem(new_name_without_ext)) # 预览时显示新文件名（不含后缀）
-                    self.rename_table.setItem(row, 2, QTableWidgetItem(ext.lstrip("."))) # 显示后缀
+                    self.rename_table.setItem(row, 1, QTableWidgetItem(""))
+                    self.rename_table.setItem(row, 2, QTableWidgetItem(new_name_without_ext))
+                    self.rename_table.setItem(row, 3, QTableWidgetItem(""))
+                    self.rename_table.setItem(row, 4, QTableWidgetItem(ext.lstrip(".")))
                     renamed_count += 1
             else:
                 self.log(f"[智能改名] 未找到匹配的代码，跳过文件: {basename}", "orange")
@@ -27062,23 +27233,54 @@ class FileManagerPro(QMainWindow):
             f"无效名称 {len(invalid)} 个。",
             "green"
         )
+    def renamer_pick_files(self):
+        start_dir = self._get_browse_start_dir()
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "选择要重命名的文件", start_dir, "所有文件 (*)")
+        if not file_paths:
+            return
+        self._last_browse_dir = os.path.dirname(file_paths[0])
+        for fp in file_paths:
+            self.renamer_add_file(fp)
+
+    def renamer_pick_folder(self):
+        start_dir = self._get_browse_start_dir()
+        folder_path = QFileDialog.getExistingDirectory(self, "选择要重命名的文件夹", start_dir)
+        if not folder_path:
+            return
+        self._last_browse_dir = folder_path
+        file_paths = []
+        for root, _, filenames in os.walk(folder_path):
+            for fname in filenames:
+                file_paths.append(os.path.join(root, fname))
+        file_paths.sort(key=lambda x: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', os.path.basename(x))])
+        for fp in file_paths:
+            self.renamer_add_file(fp)
+
     def renamer_add_file(self, fpath):
-        row = self.rename_table.rowCount(); self.rename_table.insertRow(row)
+        prefix, main, suffix, ext = self._split_renamer_filename(fpath)
+        row = self.rename_table.rowCount()
+        self.rename_table.insertRow(row)
         self.rename_table.setItem(row, 0, QTableWidgetItem(fpath))
-        self.rename_table.setItem(row, 1, QTableWidgetItem(""))
-        fname = os.path.basename(fpath)
-        if not self.ext_check.isChecked(): fname = os.path.splitext(fname)[0]
-        self.rename_table.setItem(row, 2, QTableWidgetItem(fname))
-    def renamer_toggle_ext(self, checked):
-        if not hasattr(self, "rename_table") or self.rename_table.rowCount() == 0: return
+        self.rename_table.setItem(row, 1, QTableWidgetItem(prefix))
+        self.rename_table.setItem(row, 2, QTableWidgetItem(main))
+        self.rename_table.setItem(row, 3, QTableWidgetItem(suffix))
+        self.rename_table.setItem(row, 4, QTableWidgetItem(ext))
+
+    def renamer_apply_insert_text(self):
+        text = str(self.renamer_insert_text_input.text() or "").strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "请先输入要添加的字段内容")
+            return
+        target_col = 1 if self.renamer_insert_pos_combo.currentText() == "前缀" else 3
         for i in range(self.rename_table.rowCount()):
-            fpath = self.rename_table.item(i, 0).text(); fname = os.path.basename(fpath)
-            if not checked: fname = os.path.splitext(fname)[0]
-            self.rename_table.setItem(i, 2, QTableWidgetItem(fname))
+            old = self._renamer_item_text(i, target_col)
+            new = f"{old}-{text}" if old else text
+            self.rename_table.setItem(i, target_col, QTableWidgetItem(new))
+
     def renamer_batch_replace(self):
         f = self.find_input.text(); r = self.replace_input.text(); is_re = self.regex_check.isChecked()
         for i in range(self.rename_table.rowCount()):
-            for col in (1, 2):
+            for col in (1, 2, 3):
                 item = self.rename_table.item(i, col)
                 if not item:
                     continue
@@ -27091,68 +27293,60 @@ class FileManagerPro(QMainWindow):
     def renamer_del_front(self):
         n = self.del_front_spin.value()
         for i in range(self.rename_table.rowCount()):
-            old = self.rename_table.item(i, 2).text(); self.rename_table.setItem(i, 2, QTableWidgetItem(old[n:]))
+            old = self._renamer_item_text(i, 2)
+            self.rename_table.setItem(i, 2, QTableWidgetItem(old[n:]))
+
     def renamer_del_back(self):
         n = self.del_back_spin.value()
         for i in range(self.rename_table.rowCount()):
-            old = self.rename_table.item(i, 2).text()
-            if n > 0: self.rename_table.setItem(i, 2, QTableWidgetItem(old[:-n]))
+            old = self._renamer_item_text(i, 2)
+            if n > 0:
+                self.rename_table.setItem(i, 2, QTableWidgetItem(old[:-n]))
+
     def renamer_auto_number(self):
         for i in range(self.rename_table.rowCount()):
-            old = self.rename_table.item(i, 2).text(); self.rename_table.setItem(i, 2, QTableWidgetItem(f"{i+1:02d}_{old}"))
+            old = self._renamer_item_text(i, 2)
+            self.rename_table.setItem(i, 2, QTableWidgetItem(f"{i+1:02d}_{old}"))
+
     def renamer_restore_original(self):
-        checked = self.ext_check.isChecked()
         for i in range(self.rename_table.rowCount()):
-            fpath = self.rename_table.item(i, 0).text(); fname = os.path.basename(fpath)
-            if not checked: fname = os.path.splitext(fname)[0]
-            self.rename_table.setItem(i, 1, QTableWidgetItem("")); self.rename_table.setItem(i, 2, QTableWidgetItem(fname))
-    def renamer_clear(self): self.rename_table.setRowCount(0)
+            fpath = self._renamer_item_text(i, 0)
+            prefix, main, suffix, ext = self._split_renamer_filename(fpath)
+            self.rename_table.setItem(i, 1, QTableWidgetItem(prefix))
+            self.rename_table.setItem(i, 2, QTableWidgetItem(main))
+            self.rename_table.setItem(i, 3, QTableWidgetItem(suffix))
+            self.rename_table.setItem(i, 4, QTableWidgetItem(ext))
+
+    def renamer_clear(self):
+        self.rename_table.setRowCount(0)
+        self.is_smart_rename_mode = False
+
     # detach_chat_panel / restore_chat_panel 已移除（浮动模式已删除）
 
     def renamer_execute(self):
         count = 0
         history = []
-        is_smart_mode = getattr(self, "is_smart_rename_mode", False)
         
         for i in range(self.rename_table.rowCount()):
             item_path = self.rename_table.item(i, 0)
-            item_col1 = self.rename_table.item(i, 1) # 智能模式下是新名(无后缀)，普通模式下是前缀
-            item_col2 = self.rename_table.item(i, 2) # 智能模式下是后缀，普通模式下是主文件名
             
             if not item_path: continue
             old_p = item_path.text().strip()
             if not old_p or not os.path.exists(old_p): continue
             
-            val1 = item_col1.text().strip() if item_col1 else ""
-            val2 = item_col2.text().strip() if item_col2 else ""
+            prefix_text = self._renamer_item_text(i, 1)
+            main_text = self._renamer_item_text(i, 2)
+            suffix_text = self._renamer_item_text(i, 3)
+            ext_text = self._renamer_item_text(i, 4)
             
             dname = os.path.dirname(old_p)
             original_ext = os.path.splitext(old_p)[1]
-            
-            # 自动判定模式：如果 val2 看起来像后缀(mp4, jpg等)且没有勾选"包含后缀名"，或者显式标记了智能模式
-            # 但最稳妥的是直接根据 val1 和 val2 是否能组合出有效名字
-            
-            if is_smart_mode:
-                # 智能改名模式：val1 是新名，val2 是后缀
-                new_base = self.sanitize_filename(val1)
-                new_ext = val2
-                if new_ext and not new_ext.startswith("."):
-                    new_ext = "." + new_ext
-                # 如果 val2 为空，尝试保留原后缀
-                if not new_ext:
-                    new_ext = original_ext
-                new_name = new_base + new_ext
-            else:
-                # 传统改名模式
-                if not self.ext_check.isChecked():
-                    # val1=前缀, val2=主文件名
-                    new_name = self._compose_renamer_stem(val1, val2) + original_ext
-                else:
-                    # 勾选了包含后缀名：仅当检测到明确、有效的新扩展名时才允许覆盖原后缀
-                    merged_name = self._compose_renamer_stem(val1, val2).strip()
-                    base_name, final_ext = self._resolve_renamer_name_ext(merged_name, original_ext)
-                    fallback_base = self._compose_renamer_stem(val1, val2)
-                    new_name = f"{base_name}{final_ext}" if base_name else f"{fallback_base}{original_ext}"
+            merged_stem = self._compose_renamer_full_stem(prefix_text, main_text, suffix_text).strip()
+            if not merged_stem:
+                continue
+            new_base = self.sanitize_filename(merged_stem)
+            new_ext = self._normalize_renamer_ext(ext_text, original_ext)
+            new_name = f"{new_base}{new_ext}"
 
             # 清理非法字符
             new_name = re.sub(r'[\\/:*?"<>|：]', '_', new_name).strip()
