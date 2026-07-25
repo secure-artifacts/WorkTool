@@ -16497,6 +16497,24 @@ class VideoConcatTab(QWidget):
         missing = [stem for stem in txt_stems if stem not in video_stems]
         return sorted(missing, key=self._natural_sort_key)
 
+    def _filter_concat_leaf_folder_groups(self, folder_groups):
+        """
+        只保留“最子级”的视频文件夹：
+        - 如果 A 文件夹下面还有更深层的 B 文件夹也包含视频，
+          那么 A 不参与自动拼合，只保留 B。
+        """
+        if not folder_groups:
+            return {}
+        normalized_folders = [os.path.normcase(os.path.abspath(folder)) for folder in folder_groups.keys() if folder]
+        leaf_groups = {}
+        for folder, paths in folder_groups.items():
+            abs_folder = os.path.normcase(os.path.abspath(folder))
+            prefix = abs_folder + os.sep
+            has_child_video_folder = any(other != abs_folder and other.startswith(prefix) for other in normalized_folders)
+            if not has_child_video_folder:
+                leaf_groups[folder] = paths
+        return leaf_groups
+
     def auto_fill_concat_groups_by_folder(self):
         videos = self._collect_videos()
         if not videos:
@@ -16508,6 +16526,7 @@ class VideoConcatTab(QWidget):
         for path in videos:
             folder = os.path.dirname(path)
             folder_groups.setdefault(folder, []).append(path)
+        folder_groups = self._filter_concat_leaf_folder_groups(folder_groups)
         valid_groups = []
         single_group_count = 0
         skipped_incomplete = []
