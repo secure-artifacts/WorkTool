@@ -9411,98 +9411,51 @@ class VideoCopyMatchThread(QThread):
                 self.error.emit("文案处理失败，无法进行匹配")
                 return
 
-            many_to_one_mode = len(video_meta) > len(text_meta)
             results = []
-
-            if many_to_one_mode:
-                self.log.emit("[音频文案匹配] 当前视频数量多于文案数量，将允许多个视频命中同一名称。", "gray")
-                for idx, video in enumerate(video_meta):
-                    best_name = ""
-                    best_text = ""
-                    best_transcript = ""
-                    best_sim = -1e9
-                    second_best = -1e9
-                    for txt in text_meta:
-                        sim = score_transcript_against_copy(video["transcript"], txt["content"])
-                        if sim > best_sim:
-                            second_best = best_sim
-                            best_sim = sim
-                            best_name = txt["name"]
-                            best_text = txt["content"]
-                            best_transcript = video["transcript"]
-                        elif sim > second_best:
-                            second_best = sim
-                    ok_match, threshold, reject_reason = is_copy_match_acceptable(best_sim, video["transcript"], best_text, second_best=second_best if second_best > -1e8 else None)
-                    final_score = round(best_sim * 100, 1)
-                    if ok_match:
-                        results.append({
-                            "src_label": best_name,
-                            "rename_name": best_name,
-                            "res": video["path"],
-                            "score": final_score,
-                            "srt_path": "",
-                            "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
-                            "match_ok": True,
-                        })
-                        self.log.emit(
-                            f"✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
-                            "green"
-                        )
-                    else:
-                        self.log.emit(
-                            f"⚠️ 跳过 {os.path.basename(video['path'])}：{reject_reason}，不自动改名",
-                            "orange"
-                        )
-                    self.progress.emit(70 + int((idx + 1) / max(1, len(video_meta)) * 30))
-            else:
-                import numpy as np
-                sims_matrix = []
+            self.log.emit("[音频文案匹配] 当前采用逐视频匹配：同一文本名允许命中多个视频；重名会在改名时自动追加 _2、_3。", "gray")
+            for idx, video in enumerate(video_meta):
+                best_name = ""
+                best_text = ""
+                best_transcript = ""
+                best_sim = -1e9
+                second_best = -1e9
                 for txt in text_meta:
-                    row = []
-                    for video in video_meta:
-                        row.append(score_transcript_against_copy(video["transcript"], txt["content"]))
-                    sims_matrix.append(row)
-                M = len(text_meta)
-                N = len(video_meta)
-                cols = max(M, N)
-                sims_matrix = np.array(sims_matrix, dtype=np.float32)
-                if cols != N:
-                    pad = np.full((M, cols - N), -1e9, dtype=np.float32)
-                    sims_matrix_pad = np.hstack([sims_matrix, pad])
+                    sim = score_transcript_against_copy(video["transcript"], txt["content"])
+                    if sim > best_sim:
+                        second_best = best_sim
+                        best_sim = sim
+                        best_name = txt["name"]
+                        best_text = txt["content"]
+                        best_transcript = video["transcript"]
+                    elif sim > second_best:
+                        second_best = sim
+                ok_match, threshold, reject_reason = is_copy_match_acceptable(
+                    best_sim,
+                    video["transcript"],
+                    best_text,
+                    second_best=second_best if second_best > -1e8 else None
+                )
+                final_score = round(best_sim * 100, 1)
+                if ok_match:
+                    results.append({
+                        "src_label": best_name,
+                        "rename_name": best_name,
+                        "res": video["path"],
+                        "score": final_score,
+                        "srt_path": "",
+                        "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
+                        "match_ok": True,
+                    })
+                    self.log.emit(
+                        f"✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
+                        "green"
+                    )
                 else:
-                    sims_matrix_pad = sims_matrix
-                assign_cols = self._hungarian_min_cost((-sims_matrix_pad).tolist())
-                for i, j in enumerate(assign_cols):
-                    if j is None or j < 0 or j >= N:
-                        continue
-                    txt = text_meta[i]
-                    video = video_meta[j]
-                    pair_score = float(sims_matrix[i, j])
-                    row_candidates = [float(x) for idx2, x in enumerate(sims_matrix[i].tolist()) if idx2 != j]
-                    col_candidates = [float(sims_matrix[row_idx, j]) for row_idx in range(M) if row_idx != i]
-                    second_best = max(row_candidates + col_candidates) if (row_candidates or col_candidates) else None
-                    ok_match, threshold, reject_reason = is_copy_match_acceptable(pair_score, video["transcript"], txt["content"], second_best=second_best)
-                    final_score = round(pair_score * 100, 1)
-                    if ok_match:
-                        results.append({
-                            "src_label": txt["name"],
-                            "rename_name": txt["name"],
-                            "res": video["path"],
-                            "score": final_score,
-                            "srt_path": "",
-                            "tooltip": f"文案：{txt['content']}\n\n转写：{video['transcript'][:500]}",
-                            "match_ok": True,
-                        })
-                        self.log.emit(
-                            f"✅ {os.path.basename(video['path'])} → {txt['name']} (音频匹配得分: {final_score})",
-                            "green"
-                        )
-                    else:
-                        self.log.emit(
-                            f"⚠️ 跳过 {os.path.basename(video['path'])}：{reject_reason}，不自动改名",
-                            "orange"
-                        )
-                    self.progress.emit(70 + int((i + 1) / max(1, M) * 30))
+                    self.log.emit(
+                        f"⚠️ 跳过 {os.path.basename(video['path'])}：{reject_reason}，不自动改名",
+                        "orange"
+                    )
+                self.progress.emit(70 + int((idx + 1) / max(1, len(video_meta)) * 30))
 
             results.sort(key=lambda x: str(x.get("res", "")).lower())
             self.progress.emit(100)
@@ -22098,6 +22051,7 @@ class FileManagerPro(QMainWindow):
         res_base = self.uni_match_res_input.text().split('\n')[0]
         res_base = res_base if os.path.isdir(res_base) else os.path.dirname(res_base)
         name_pref = self.get_universal_match_name_source_mode()
+        rename_name_counts = {}
         for m in matches:
             try:
                 res_rel = os.path.relpath(m['res'], res_base)
@@ -22129,7 +22083,11 @@ class FileManagerPro(QMainWindow):
                     rename_name=raw_text_name,
                     mode_override="audio_text"
                 )
-            rename_name = base_rename_name or raw_text_name
+            base_rename_name = base_rename_name or raw_text_name
+            seq = rename_name_counts.get(base_rename_name, 0) + 1 if base_rename_name else 1
+            if base_rename_name:
+                rename_name_counts[base_rename_name] = seq
+            rename_name = base_rename_name if (not base_rename_name or seq == 1) else f"{base_rename_name}_{seq}"
             res_ext = os.path.splitext(str(m.get('res', '') or res_rel))[1]
             is_rename_preview = bool(rename_name) and not srt_abs and not txt_abs
             display_label = f"{rename_name}{res_ext}" if is_rename_preview and res_ext else (rename_name if is_rename_preview else (m.get('src_label', '') or rename_name))
