@@ -22168,8 +22168,10 @@ class FileManagerPro(QMainWindow):
                 rename_name="",
                 mode_override="general"
             ) or os.path.splitext(os.path.basename(m.get('src', '') or src_rel))[0]
-            seq = rename_name_counts.get(base_rename_name, 0) + 1
-            rename_name_counts[base_rename_name] = seq
+            res_dir_key = os.path.abspath(os.path.dirname(str(m.get('res', '') or ""))) if str(m.get('res', '') or "").strip() else ""
+            count_key = (res_dir_key, str(base_rename_name or "").strip())
+            seq = rename_name_counts.get(count_key, 0) + 1
+            rename_name_counts[count_key] = seq
             rename_name = base_rename_name if seq == 1 else f"{base_rename_name}_{seq}"
             res_ext = os.path.splitext(str(m.get('res', '') or res_rel))[1]
             display_name = f"{rename_name}{res_ext}" if rename_name and res_ext else (rename_name or src_rel)
@@ -22217,9 +22219,11 @@ class FileManagerPro(QMainWindow):
                     mode_override="audio_text"
                 )
             base_rename_name = base_rename_name or raw_text_name
-            seq = rename_name_counts.get(base_rename_name, 0) + 1 if base_rename_name else 1
+            res_dir_key = os.path.abspath(os.path.dirname(str(m.get('res', '') or ""))) if str(m.get('res', '') or "").strip() else ""
+            count_key = (res_dir_key, str(base_rename_name or "").strip())
+            seq = rename_name_counts.get(count_key, 0) + 1 if base_rename_name else 1
             if base_rename_name:
-                rename_name_counts[base_rename_name] = seq
+                rename_name_counts[count_key] = seq
             rename_name = base_rename_name if (not base_rename_name or seq == 1) else f"{base_rename_name}_{seq}"
             res_ext = os.path.splitext(str(m.get('res', '') or res_rel))[1]
             is_rename_preview = bool(rename_name) and not srt_abs and not txt_abs
