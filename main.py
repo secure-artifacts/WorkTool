@@ -110,225 +110,6 @@ SORTER_AUTO_DIR_MARKER = ".ai_sorter_auto_dir"
 
 _API_THROTTLE_LOCK = Lock()
 _API_NEXT_ALLOWED_TS = {}
-_RUNTIME_INSTALL_STATE_LOCK = Lock()
-
-
-def _load_config_dict_safely():
-    try:
-        if not os.path.exists(CONFIG_FILE):
-            return {}
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_config_dict_safely(cfg):
-    data = cfg if isinstance(cfg, dict) else {}
-    try:
-        tmp_path = CONFIG_FILE + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        os.replace(tmp_path, CONFIG_FILE)
-        return True
-    except Exception:
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-            return True
-        except Exception:
-            return False
-
-
-def _normalize_runtime_install_records(records):
-    if not isinstance(records, dict):
-        return {}
-    normalized = {}
-    for key, item in records.items():
-        if isinstance(item, dict):
-            normalized[str(key)] = dict(item)
-    return normalized
-
-
-def _load_runtime_install_state():
-    cfg = _load_config_dict_safely()
-    return _normalize_runtime_install_records(cfg.get("runtime_installs", {}))
-
-
-def _get_runtime_install_record(state_key):
-    records = _load_runtime_install_state()
-    return dict(records.get(str(state_key or "").strip(), {}) or {})
-
-
-def _update_runtime_install_record(state_key, installed=None, version=None, error=None, package_names=None, python_exe=None, extra=None):
-    key = str(state_key or "").strip()
-    if not key:
-        return {}
-    with _RUNTIME_INSTALL_STATE_LOCK:
-        cfg = _load_config_dict_safely()
-        records = _normalize_runtime_install_records(cfg.get("runtime_installs", {}))
-        entry = dict(records.get(key, {}) or {})
-        if installed is not None:
-            entry["installed"] = bool(installed)
-        if version is not None:
-            entry["version"] = str(version or "")
-        if error is not None:
-            entry["error"] = str(error or "")
-        if package_names is not None:
-            entry["packages"] = [str(x or "").strip() for x in package_names if str(x or "").strip()]
-        if python_exe is None:
-            py_exe = sys.executable or ""
-            try:
-                if "_resolve_preferred_python_exe" in globals():
-                    py_exe, manual_exe = _resolve_preferred_python_exe()
-                    python_exe = manual_exe or py_exe or sys.executable or ""
-                else:
-                    python_exe = py_exe
-            except Exception:
-                python_exe = py_exe
-        entry["python_exe"] = str(python_exe or "")
-        entry["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if isinstance(extra, dict):
-            for k, v in extra.items():
-                entry[str(k)] = v
-        records[key] = entry
-        cfg["runtime_installs"] = records
-        _save_config_dict_safely(cfg)
-        return entry
-
-
-def _get_module_version_safe(module_name):
-    name = str(module_name or "").strip()
-    if not name:
-        return ""
-    try:
-        mod = importlib.import_module(name)
-    except Exception:
-        return ""
-    for attr in ("__version__", "version"):
-        value = getattr(mod, attr, "")
-        if value:
-            return str(value)
-    return ""
-
-
-def _can_import_modules(module_names):
-    names = [str(x or "").strip() for x in (module_names or []) if str(x or "").strip()]
-    if not names:
-        return False
-    try:
-        for name in names:
-            importlib.import_module(name)
-        return True
-    except Exception:
-        return False
-
-
-def _has_trusted_runtime_install(state_key):
-    entry = _get_runtime_install_record(state_key)
-    if not entry or not entry.get("installed", False):
-        return False, entry
-    try:
-        py_exe = sys.executable or ""
-        if "_resolve_preferred_python_exe" in globals():
-            py_exe, manual_exe = _resolve_preferred_python_exe()
-            py_exe = manual_exe or py_exe or sys.executable or ""
-        current_exe = os.path.normcase(os.path.abspath(str(py_exe or "")))
-        saved_exe = os.path.normcase(os.path.abspath(str(entry.get("python_exe", "") or "")))
-        if saved_exe and current_exe and saved_exe != current_exe:
-            return False, entry
-    except Exception:
-        pass
-    return True, entry
-
-
-def _mark_runtime_install_success(state_key, module_name=None, package_names=None, extra=None):
-    version = _get_module_version_safe(module_name) if module_name else ""
-    return _update_runtime_install_record(
-        state_key,
-        installed=True,
-        version=version,
-        error="",
-        package_names=package_names,
-        extra=extra,
-    )
-
-
-def _mark_runtime_install_failed(state_key, error="", package_names=None, extra=None):
-    return _update_runtime_install_record(
-        state_key,
-        installed=False,
-        error=str(error or ""),
-        package_names=package_names,
-        extra=extra,
-    )
-
-
-def _ensure_runtime_packages_cached(pip_libs, validator, module_prefixes, log_fn=None, label="运行时依赖", timeout=600, force_reinstall=False, extra_pip_args=None, state_key=None, import_probe_modules=None):
-    runtime_key = str(state_key or (pip_libs[0] if pip_libs else label)).strip() or label
-    probe_modules = [str(x or "").strip() for x in (import_probe_modules or pip_libs or []) if str(x or "").strip()]
-
-    if probe_modules and _can_import_modules(probe_modules):
-        _mark_runtime_install_success(runtime_key, module_name=probe_modules[0], package_names=pip_libs, extra={"last_label": label})
-        if callable(log_fn):
-            log_fn(f"ℹ️ {label} 已可直接导入，跳过自动安装", "gray")
-        return True, {"cached": True, "source": "import_probe"}
-
-    trusted, _ = _has_trusted_runtime_install(runtime_key)
-    if trusted:
-        if callable(log_fn):
-            log_fn(f"ℹ️ {label} 命中历史安装记录，当前导入失败，准备自动修复一次", "gray")
-        _mark_runtime_install_failed(runtime_key, error="命中历史安装记录但导入失败，已转入自动修复", package_names=pip_libs, extra={"last_label": label})
-
-    ok, info = _ensure_runtime_packages(
-        pip_libs,
-        validator,
-        module_prefixes,
-        log_fn=log_fn,
-        label=label,
-        timeout=timeout,
-        force_reinstall=force_reinstall,
-        extra_pip_args=extra_pip_args,
-    )
-    if ok:
-        _mark_runtime_install_success(runtime_key, module_name=probe_modules[0] if probe_modules else None, package_names=pip_libs, extra={"last_label": label})
-    else:
-        detail = str((info or {}).get("error", "") or "未知错误").strip()
-        _mark_runtime_install_failed(runtime_key, error=detail, package_names=pip_libs, extra={"last_label": label})
-    return ok, info
-
-
-def _silent_install_libs_once(pip_libs, timeout=120, log_prefix="[ENV]", force_reinstall=False, extra_pip_args=None, state_key=None, import_probe_modules=None):
-    targets = [str(lib or "").strip() for lib in (pip_libs or []) if str(lib or "").strip()]
-    if not targets:
-        return True, {"noop": True}
-    runtime_key = str(state_key or targets[0]).strip() or targets[0]
-    probe_modules = [str(x or "").strip() for x in (import_probe_modules or targets) if str(x or "").strip()]
-
-    if probe_modules and _can_import_modules(probe_modules):
-        entry = _mark_runtime_install_success(runtime_key, module_name=probe_modules[0], package_names=targets, extra={"last_label": log_prefix})
-        return True, {"cached": True, "source": "import_probe", "entry": entry}
-
-    trusted, _ = _has_trusted_runtime_install(runtime_key)
-    if trusted:
-        _mark_runtime_install_failed(runtime_key, error="命中历史安装记录但导入失败，已转入自动重装", package_names=targets, extra={"last_label": log_prefix})
-
-    ok = _silent_install_libs(
-        targets,
-        timeout=timeout,
-        log_prefix=log_prefix,
-        force_reinstall=force_reinstall,
-        extra_pip_args=extra_pip_args,
-    )
-    if ok and (not probe_modules or _can_import_modules(probe_modules)):
-        entry = _mark_runtime_install_success(runtime_key, module_name=probe_modules[0] if probe_modules else None, package_names=targets, extra={"last_label": log_prefix})
-        return True, {"installed": True, "entry": entry}
-
-    err_msg = "自动安装完成但模块仍无法导入" if ok else "自动安装失败"
-    entry = _mark_runtime_install_failed(runtime_key, error=err_msg, package_names=targets, extra={"last_label": log_prefix})
-    return False, {"error": err_msg, "entry": entry}
-
 
 def normalize_api_base(api_base, default=""):
     return (api_base or default or "").strip().rstrip("/")
@@ -3098,7 +2879,7 @@ def _pick_nonconflict_path(dst_path):
     # 极端兜底：回退到 uuid，避免死循环
     return os.path.join(base_dir, f"{stem_base}_{uuid.uuid4().hex[:6]}{ext}")
 
-def _silent_install_libs(libs, timeout=120, log_prefix="[ENV]", force_reinstall=False, extra_pip_args=None):
+def _silent_install_libs(libs, timeout=120, log_prefix="[ENV]"):
     """复用现有静默依赖安装逻辑，按 import 名输入。"""
     targets = [str(lib or "").strip() for lib in (libs or []) if str(lib or "").strip()]
     if not targets:
@@ -3114,14 +2895,7 @@ def _silent_install_libs(libs, timeout=120, log_prefix="[ENV]", force_reinstall=
     success = True
     for lib in targets:
         pkg = _normalize_pip_package_name(lib)
-        extra_parts = [str(x).strip() for x in (extra_pip_args or []) if str(x).strip()]
-        pip_parts = ["install", "--upgrade"]
-        if force_reinstall:
-            pip_parts.append("--force-reinstall")
-        pip_parts.append("--no-cache-dir")
-        pip_parts.extend(extra_parts)
-        pip_parts.append(pkg)
-        cmd = f'{py_exe_quoted} -m pip {" ".join(pip_parts)}'
+        cmd = f'{py_exe_quoted} -m pip install --upgrade {pkg} --no-cache-dir'
         try:
             creationflags = 0x08000000 if sys.platform == 'win32' else 0
             res = subprocess.run(cmd, shell=True, capture_output=True, text=True, creationflags=creationflags, timeout=max(30, int(timeout or 120)))
@@ -3147,144 +2921,6 @@ def _silent_install_libs(libs, timeout=120, log_prefix="[ENV]", force_reinstall=
         except Exception:
             pass
     return bool(success)
-
-def _purge_modules(module_prefixes):
-    """清理已加载模块，避免半初始化模块残留导致重复导入继续报错。"""
-    removed = []
-    prefixes = [str(x or "").strip() for x in (module_prefixes or []) if str(x or "").strip()]
-    if not prefixes:
-        return removed
-    for name in list(sys.modules.keys()):
-        for prefix in prefixes:
-            if name == prefix or name.startswith(prefix + "."):
-                removed.append(name)
-                sys.modules.pop(name, None)
-                break
-    return removed
-
-def _find_shadowing_paths(module_names, search_root=None):
-    """检测程序目录下是否存在会遮蔽三方库导入的同名文件/目录。"""
-    root = str(search_root or "").strip()
-    if not root or not os.path.isdir(root):
-        return []
-    hits = []
-    for name in [str(x or "").strip() for x in (module_names or []) if str(x or "").strip()]:
-        file_candidate = os.path.join(root, f"{name}.py")
-        dir_candidate = os.path.join(root, name)
-        if os.path.isfile(file_candidate):
-            hits.append(file_candidate)
-        if os.path.isdir(dir_candidate):
-            hits.append(dir_candidate)
-    return sorted(set(hits))
-
-def _validate_torch_runtime():
-    """验证 PyTorch 是否为可用的二进制扩展版本，而不是坏安装/路径污染。"""
-    try:
-        import importlib
-        torch = importlib.import_module("torch")
-        module_file = str(getattr(torch, "__file__", "") or "")
-        c_mod = getattr(torch, "_C", None)
-        if c_mod is None:
-            raise ImportError("torch._C 不存在，PyTorch C 扩展未成功加载。")
-        c_file = str(getattr(c_mod, "__file__", "") or "")
-        if c_file and os.path.isdir(c_file):
-            raise ImportError(f"torch._C 指向了目录而不是二进制扩展: {c_file}")
-        _ = torch.tensor([0.0]).sum().item()
-        cuda_available = False
-        try:
-            cuda_available = bool(torch.cuda.is_available())
-        except Exception:
-            pass
-        return True, {
-            "module_file": module_file,
-            "c_file": c_file,
-            "version": str(getattr(torch, "__version__", "") or ""),
-            "cuda_available": cuda_available,
-        }
-    except Exception as e:
-        return False, {"error": str(e)}
-
-def _validate_transformers_runtime():
-    """验证 transformers + safetensors 基础栈是否可导入。"""
-    try:
-        import importlib
-        transformers = importlib.import_module("transformers")
-        safetensors = importlib.import_module("safetensors")
-        return True, {
-            "transformers_version": str(getattr(transformers, "__version__", "") or ""),
-            "safetensors_file": str(getattr(safetensors, "__file__", "") or ""),
-        }
-    except Exception as e:
-        return False, {"error": str(e)}
-
-def _validate_sentence_transformers_runtime():
-    """验证 sentence-transformers 路径是否健康，同时显式检查 regex C 扩展。"""
-    try:
-        import importlib
-        regex = importlib.import_module("regex")
-        importlib.import_module("regex._regex")
-        _ = regex.compile(r"\w+")
-        st = importlib.import_module("sentence_transformers")
-        return True, {
-            "regex_file": str(getattr(regex, "__file__", "") or ""),
-            "sentence_transformers_version": str(getattr(st, "__version__", "") or ""),
-        }
-    except Exception as e:
-        return False, {"error": str(e)}
-
-def _validate_cn_clip_runtime():
-    """验证 cn_clip 是否可导入。"""
-    try:
-        import importlib
-        clip_mod = importlib.import_module("cn_clip.clip")
-        return True, {"module_file": str(getattr(clip_mod, "__file__", "") or "")}
-    except Exception as e:
-        return False, {"error": str(e)}
-
-def _ensure_runtime_packages(pip_libs, validator, module_prefixes, log_fn=None, label="运行时依赖", timeout=600, force_reinstall=False, extra_pip_args=None):
-    """运行时健康检查 + 自动修复。"""
-    ok, info = validator()
-    if ok:
-        return True, info
-    if callable(log_fn):
-        detail = str((info or {}).get("error", "") or "").strip()
-        if detail:
-            log_fn(f"🩹 检测到 {label} 异常，正在自动修复：{detail}", "orange")
-        else:
-            log_fn(f"🩹 检测到 {label} 异常，正在自动修复...", "orange")
-    _purge_modules(module_prefixes)
-    try:
-        importlib.invalidate_caches()
-    except Exception:
-        pass
-    installed = _silent_install_libs(
-        pip_libs,
-        timeout=timeout,
-        log_prefix=f"[{label}]",
-        force_reinstall=force_reinstall,
-        extra_pip_args=extra_pip_args,
-    )
-    _purge_modules(module_prefixes)
-    try:
-        importlib.invalidate_caches()
-    except Exception:
-        pass
-    repaired_ok, repaired_info = validator()
-    return bool(installed and repaired_ok), repaired_info if repaired_ok else repaired_info or info
-
-def _normalize_clip_model_name(model_name):
-    default_name = "OFA-Sys/chinese-clip-vit-large-patch14"
-    raw_name = (model_name or default_name).strip() or default_name
-    alias_map = {
-        "clip-ViT-L-14": "openai/clip-vit-large-patch14",
-        "clip-ViT-B-16": "openai/clip-vit-base-patch16",
-        "clip-ViT-B-32": "openai/clip-vit-base-patch32",
-    }
-    return alias_map.get(raw_name, raw_name), raw_name
-
-def _is_cn_clip_model_name(model_name):
-    name = str(model_name or "").strip().lower()
-    return ("chinese-clip" in name) or ("cn-clip" in name) or name.startswith("ofa-sys/")
 
 def silent_env_check():
     """Check and install only core runtime packages at startup; heavy AI packages stay on-demand."""
@@ -3596,96 +3232,6 @@ def score_transcript_against_copy(transcript, copy_text):
     contains_bonus = 0.12 if (len(a) >= 8 and a in b) or (len(b) >= 8 and b in a) else 0.0
     return max(0.0, min(1.0, ratio * 0.45 + lcs_ratio * 0.35 + gram_ratio * 0.20 + contains_bonus))
 
-
-def get_copy_match_accept_threshold(transcript, copy_text):
-    transcript_norm = normalize_spoken_text(transcript)
-    copy_norm = normalize_spoken_text(copy_text)
-    target_len = len(copy_norm)
-    threshold = 0.36
-    if target_len >= 12:
-        threshold = 0.42
-    if target_len >= 28:
-        threshold = 0.48
-    if target_len >= 60:
-        threshold = 0.54
-    if transcript_norm and copy_norm:
-        len_ratio = min(len(transcript_norm), len(copy_norm)) / max(1, max(len(transcript_norm), len(copy_norm)))
-        if len_ratio < 0.35:
-            threshold += 0.05
-        if len_ratio < 0.20:
-            threshold += 0.06
-    return max(0.30, min(0.72, threshold))
-
-
-def is_copy_match_acceptable(best_score, transcript, copy_text, second_best=None):
-    try:
-        score = float(best_score or 0.0)
-    except Exception:
-        score = 0.0
-    threshold = get_copy_match_accept_threshold(transcript, copy_text)
-    if score < threshold:
-        return False, threshold, f"得分过低({score:.2f} < {threshold:.2f})"
-    if second_best is not None:
-        try:
-            margin = score - float(second_best or 0.0)
-        except Exception:
-            margin = score
-        if margin < 0.035 and score < min(0.78, threshold + 0.10):
-            return False, threshold, f"候选过于接近，结果不够确定(差值 {margin:.3f})"
-    return True, threshold, ""
-
-
-def is_universal_match_reliable(visual_sim=None, audio_sim=None, hash_sim=None):
-    def _norm(v):
-        try:
-            val = float(v)
-        except Exception:
-            return None
-        if val < 0:
-            return None
-        return val
-
-    visual = _norm(visual_sim)
-    audio = _norm(audio_sim)
-    dhash = _norm(hash_sim)
-
-    if visual is not None and audio is not None:
-        avg = (visual + audio) / 2.0
-        if max(visual, audio) >= 0.60 and avg >= 0.52:
-            return True, ""
-        return False, f"视听证据不足(视觉 {visual:.3f} / 音频 {audio:.3f})"
-    if visual is not None:
-        if visual >= 0.62:
-            return True, ""
-        return False, f"视觉相似度过低({visual:.3f})"
-    if audio is not None:
-        if audio >= 0.58:
-            return True, ""
-        return False, f"音频相似度过低({audio:.3f})"
-    if dhash is not None:
-        if dhash >= 0.82:
-            return True, ""
-        return False, f"画面哈希相似度过低({dhash:.3f})"
-    return False, "没有可用的匹配证据"
-
-
-def should_skip_universal_rename(score_value, result_kind="general"):
-    kind = str(result_kind or "general").strip().lower()
-    try:
-        score = float(str(score_value or "").replace("分", "").strip())
-    except Exception:
-        score = None
-    if score is None:
-        return False, ""
-    if kind == "audio_text":
-        threshold = 48.0
-        if score < threshold:
-            return True, f"文案匹配得分过低({score:.1f} < {threshold:.1f})"
-        return False, ""
-    # 普通全能对位结果在前面的匹配线程里已经做过可靠性过滤，
-    # 这里不再用统一分值硬拦一次，避免 CLIP 失效时备用分数体系被误伤。
-    return False, ""
-
 def format_srt_timestamp(seconds):
     try:
         total_ms = max(0, int(round(float(seconds or 0.0) * 1000)))
@@ -3772,18 +3318,8 @@ def build_copy_items_from_sources(path_input="", manual_text=""):
             return
         sig = normalize_spoken_text(content)
         if not sig or sig in seen_signatures:
-            if source_path:
-                source_sig = f"{os.path.abspath(str(source_path))}::{sig}"
-                if source_sig in seen_signatures:
-                    return
-                seen_signatures.add(source_sig)
-            else:
-                return
-        else:
-            if source_path:
-                seen_signatures.add(f"{os.path.abspath(str(source_path))}::{sig}")
-            else:
-                seen_signatures.add(sig)
+            return
+        seen_signatures.add(sig)
         items.append({
             "index": len(items),
             "name": clean_long_filename(name or build_copy_match_name(content, len(items) + 1), max_len=80),
@@ -5798,61 +5334,9 @@ class ClipFastMatchThread(QThread):
         normalized_name = (model_name or default_chinese_clip).strip()
         if not normalized_name:
             normalized_name = default_chinese_clip
-        normalized_name, original_name = _normalize_clip_model_name(normalized_name)
-        if original_name != normalized_name:
-            log_fn(f"ℹ️ CLIP 模型别名已自动映射：{original_name} -> {normalized_name}", "gray")
 
         if cls._clip_model is not None and cls._clip_model_name == normalized_name:
             return cls._clip_model
-
-        shadow_hits = _find_shadowing_paths(["torch", "regex", "transformers", "cn_clip"], search_root=base_dir)
-        if shadow_hits:
-            hit_text = "；".join(os.path.basename(p) for p in shadow_hits[:6])
-            log_fn(f"⚠️ 程序目录中发现可能干扰导入的同名文件/目录：{hit_text}", "orange")
-
-        _purge_modules(["torch", "functorch", "torchvision", "transformers", "safetensors", "sentence_transformers", "regex", "cn_clip"])
-        try:
-            importlib.invalidate_caches()
-        except Exception:
-            pass
-
-        torch_ready, torch_info = _ensure_runtime_packages_cached(
-            ["torch", "torchvision"],
-            _validate_torch_runtime,
-            ["torch", "functorch", "torchvision"],
-            log_fn=log_fn,
-            label="PyTorch 运行时",
-            timeout=2400,
-            force_reinstall=False,
-            state_key="torch_runtime",
-            import_probe_modules=["torch", "torchvision"],
-        )
-        if not torch_ready:
-            detail = str((torch_info or {}).get("error", "") or "未知错误").strip()
-            raise RuntimeError(
-                "CLIP 运行环境修复失败：PyTorch 仍不可用。\n"
-                f"原因：{detail}\n"
-                "建议：确认网络可用，并使用当前程序自带的 Python 重新安装 torch / torchvision。"
-            )
-
-        tf_stack_ready, tf_stack_info = _ensure_runtime_packages_cached(
-            ["transformers", "safetensors"],
-            _validate_transformers_runtime,
-            ["transformers", "safetensors"],
-            log_fn=log_fn,
-            label="Transformers 运行时",
-            timeout=1800,
-            force_reinstall=False,
-            state_key="transformers_runtime",
-            import_probe_modules=["transformers", "safetensors"],
-        )
-        if not tf_stack_ready:
-            detail = str((tf_stack_info or {}).get("error", "") or "未知错误").strip()
-            raise RuntimeError(
-                "CLIP 运行环境修复失败：Transformers 依赖仍不可用。\n"
-                f"原因：{detail}\n"
-                "建议：确认网络可用，并重新安装 transformers / safetensors。"
-            )
 
         device = "cpu"
         if use_gpu:
@@ -5870,7 +5354,24 @@ class ClipFastMatchThread(QThread):
         st_load_error = None
         tf_load_error = None
         try:
-            # 优先走更稳定的 Transformers 直连方案，避免新环境下 sentence-transformers + regex 的额外脆弱性。
+            # 优先尝试使用 sentence-transformers 加载 Hugging Face 模型
+            from sentence_transformers import SentenceTransformer
+            log_fn(f"⏳ 正在加载 CLIP 模型: {normalized_name}（首次需下载，后续将直接从缓存读取）", "blue")
+            cls._clip_model = SentenceTransformer(normalized_name, device=device)
+            cls._clip_model_name = normalized_name
+            log_fn(f"✅ CLIP 模型加载完成 (device={device})", "green")
+            return cls._clip_model
+        except Exception as e:
+            st_load_error = e
+            msg = str(e)
+            if ("upgrade torch to at least v2.6" in msg) or ("CVE-2025-32434" in msg):
+                log_fn(f"⚠️ sentence-transformers 因 PyTorch 版本安全限制拒绝加载（{e}）", "orange")
+                log_fn("💡 解决思路：升级 torch>=2.6，或改用 Transformers(优先 safetensors) / cn_clip 加载。", "gray")
+            else:
+                log_fn(f"⚠️ sentence-transformers 加载失败 ({e})", "orange")
+
+        # 备选：直接使用 Transformers 加载 CLIP（优先 safetensors，绕开 sentence-transformers 的版本限制）
+        try:
             import torch
             log_fn("🔄 尝试使用 Transformers 直接加载 CLIP（优先 safetensors）...", "gray")
             # Windows + pythonw 场景下，sys.stdout/sys.stderr 可能为 None，
@@ -5886,37 +5387,16 @@ class ClipFastMatchThread(QThread):
             # 关闭 Hub 进度条（避免触发终端相关判断）
             os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
             os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-            from transformers import AutoModel, AutoProcessor, CLIPModel, CLIPProcessor
+            from transformers import CLIPModel, CLIPProcessor
 
             # device 字符串 -> torch.device
             torch_device = torch.device(device)
-
-            def _load_hf_model(model_id):
-                last_error = None
-                for loader_name, loader_cls in (("AutoModel", AutoModel), ("CLIPModel", CLIPModel)):
-                    for use_safetensors in (True, False):
-                        try:
-                            return loader_cls.from_pretrained(model_id, use_safetensors=use_safetensors)
-                        except TypeError:
-                            try:
-                                return loader_cls.from_pretrained(model_id)
-                            except Exception as inner_e:
-                                last_error = inner_e
-                        except Exception as inner_e:
-                            last_error = inner_e
-                raise last_error or RuntimeError("无法加载 Hugging Face 模型")
-
-            def _load_hf_processor(model_id):
-                last_error = None
-                for loader_name, loader_cls in (("AutoProcessor", AutoProcessor), ("CLIPProcessor", CLIPProcessor)):
-                    try:
-                        return loader_cls.from_pretrained(model_id)
-                    except Exception as inner_e:
-                        last_error = inner_e
-                raise last_error or RuntimeError("无法加载 Hugging Face Processor")
-
-            clip_model = _load_hf_model(normalized_name)
-            clip_processor = _load_hf_processor(normalized_name)
+            # 优先使用 safetensors；如果仓库没有 safetensors，则自动回退到 .bin 权重
+            try:
+                clip_model = CLIPModel.from_pretrained(normalized_name, use_safetensors=True)
+            except Exception:
+                clip_model = CLIPModel.from_pretrained(normalized_name, use_safetensors=False)
+            clip_processor = CLIPProcessor.from_pretrained(normalized_name)
             clip_model.eval().to(torch_device)
 
             class TransformersClipAdapter:
@@ -6025,114 +5505,75 @@ class ClipFastMatchThread(QThread):
             return cls._clip_model
         except Exception as e:
             tf_load_error = e
-            log_fn(f"⚠️ Transformers 加载失败 ({e})", "orange")
+            log_fn(f"⚠️ Transformers 加载失败 ({e})，尝试使用 cn_clip 官方库加载...", "orange")
 
-        cn_e = "已跳过（当前模型不是 CN-CLIP 系列）"
-        if _is_cn_clip_model_name(normalized_name):
+        # 如果 sentence-transformers 加载失败，尝试 cn_clip 官方库
+        try:
+            import torch
             try:
-                cn_ready, cn_info = _ensure_runtime_packages(
-                    ["cn_clip"],
-                    _validate_cn_clip_runtime,
-                    ["cn_clip"],
-                    log_fn=log_fn,
-                    label="CN-CLIP 运行时",
-                    timeout=1800,
-                    force_reinstall=False,
-                )
-                if not cn_ready:
-                    raise ImportError(str((cn_info or {}).get("error", "") or "cn_clip 自动修复失败"))
-
-                import torch
+                import cn_clip.clip as clip
+                from cn_clip.clip import load_from_name
+            except ImportError:
+                log_fn("📦 检测到 cn_clip 缺失，正在自动安装 cn-clip...", "blue")
+                if not _silent_install_libs(["cn_clip"], timeout=1800, log_prefix="[CN-CLIP]"):
+                    raise ImportError("缺失 cn_clip 库，且自动安装失败。")
+                import importlib
+                importlib.invalidate_caches()
                 import cn_clip.clip as clip
                 from cn_clip.clip import load_from_name
 
-                model_short_name = normalized_name.split("/")[-1].replace("chinese-clip-", "").upper()
-                # 适配 cn_clip 官方库的模型名称
-                if model_short_name == "VIT-L-14":
-                    model_short_name = "ViT-L-14"
-                elif model_short_name == "VIT-H-14":
-                    model_short_name = "ViT-H-14"
-                elif model_short_name == "VIT-B-16":
-                    model_short_name = "ViT-B-16"
-                elif model_short_name == "VIT-B-32":
-                    model_short_name = "ViT-B-32"
-                elif model_short_name == "RN50":
-                    model_short_name = "RN50"
-                else:
-                    model_short_name = "ViT-L-14"
+            model_short_name = normalized_name.split("/")[-1].replace("chinese-clip-", "").upper()
+            # 适配 cn_clip 官方库的模型名称
+            if model_short_name == "VIT-L-14": model_short_name = "ViT-L-14"
+            elif model_short_name == "VIT-H-14": model_short_name = "ViT-H-14"
+            elif model_short_name == "VIT-B-16": model_short_name = "ViT-B-16"
+            elif model_short_name == "RN50": model_short_name = "RN50"
+            else: model_short_name = "ViT-L-14" # 默认一个，确保能加载
 
-                # 尝试从 ModelScope 自动下载
-                log_fn(f"⏳ 正在加载 CN-CLIP 模型: {model_short_name}（首次需下载，后续将直接从缓存读取）", "blue")
-                model, preprocess = load_from_name(model_short_name, device=device, download_root=os.environ["HF_HOME"], use_modelscope=True)
+            # 尝试从 ModelScope 自动下载
+            log_fn(f"⏳ 正在加载 CN-CLIP 模型: {model_short_name}（首次需下载，后续将直接从缓存读取）", "blue")
+            # 使用 download_root 和 use_modelscope=True 确保自动下载
+            model, preprocess = load_from_name(model_short_name, device=device, download_root=os.environ["HF_HOME"], use_modelscope=True)
 
-                class CnClipAdapter:
-                    def __init__(self, model, preprocess, device):
-                        self.model = model.eval().to(device)
-                        self.preprocess = preprocess
-                        self.device = device
+            class CnClipAdapter:
+                def __init__(self, model, preprocess, device):
+                    self.model = model.eval().to(device)
+                    self.preprocess = preprocess
+                    self.device = device
 
-                    def encode(self, sentences, batch_size=32, show_progress_bar=False, convert_to_numpy=True):
-                        from PIL import Image
-                        import numpy as np
-                        import torch
+                def encode(self, sentences, batch_size=32, show_progress_bar=False, convert_to_numpy=True):
+                    from PIL import Image
+                    import numpy as np
+                    import torch
 
-                        if isinstance(sentences[0], Image.Image):
-                            processed_images = torch.stack([self.preprocess(img) for img in sentences]).to(self.device)
-                            with torch.no_grad():
-                                features = self.model.encode_image(processed_images)
-                        else:
-                            tokenized_texts = clip.tokenize(sentences).to(self.device)
-                            with torch.no_grad():
-                                features = self.model.encode_text(tokenized_texts)
-                        features /= features.norm(dim=-1, keepdim=True)
-                        return features.cpu().numpy() if convert_to_numpy else features
+                    if isinstance(sentences[0], Image.Image):
+                        processed_images = torch.stack([self.preprocess(img) for img in sentences]).to(self.device)
+                        with torch.no_grad():
+                            features = self.model.encode_image(processed_images)
+                    else:
+                        tokenized_texts = clip.tokenize(sentences).to(self.device)
+                        with torch.no_grad():
+                            features = self.model.encode_text(tokenized_texts)
+                    features /= features.norm(dim=-1, keepdim=True)
+                    return features.cpu().numpy() if convert_to_numpy else features
 
-                cls._clip_model = CnClipAdapter(model, preprocess, device)
-                cls._clip_model_name = normalized_name
-                log_fn(f"✅ CN-CLIP 模型加载完成 (device={device})", "green")
-                return cls._clip_model
-            except Exception as e:
-                cn_e = e
-                log_fn(f"⚠️ CN-CLIP 加载失败 ({e})", "orange")
-
-        try:
-            st_ready, st_info = _ensure_runtime_packages(
-                ["regex", "sentence_transformers"],
-                _validate_sentence_transformers_runtime,
-                ["regex", "sentence_transformers"],
-                log_fn=log_fn,
-                label="sentence-transformers 运行时",
-                timeout=1800,
-                force_reinstall=True,
-            )
-            if not st_ready:
-                raise ImportError(str((st_info or {}).get("error", "") or "sentence-transformers 自动修复失败"))
-            from sentence_transformers import SentenceTransformer
-            log_fn(f"⏳ 正在使用 sentence-transformers 回退加载 CLIP: {normalized_name}", "gray")
-            cls._clip_model = SentenceTransformer(normalized_name, device=device)
+            cls._clip_model = CnClipAdapter(model, preprocess, device)
             cls._clip_model_name = normalized_name
-            log_fn(f"✅ sentence-transformers 回退加载完成 (device={device})", "green")
+            log_fn(f"✅ CN-CLIP 模型加载完成 (device={device})", "green")
             return cls._clip_model
-        except Exception as e:
-            st_load_error = e
-
-        shadow_hint = ""
-        if shadow_hits:
-            shadow_hint = "\n  - 导入遮蔽风险: 程序目录存在与三方库同名的文件/目录，请改名后重试。"
-        final_error_msg = (
-            "CLIP 模型加载失败：\n"
-            f"  - transformers 尝试失败: {tf_load_error}\n"
-            f"  - cn_clip 尝试失败: {cn_e}\n"
-            f"  - sentence-transformers 尝试失败: {st_load_error}"
-            f"{shadow_hint}\n"
-            "已自动执行运行时修复，但仍未恢复。\n"
-            "建议按优先级排查：\n"
-            "  1) 确认当前程序目录下没有 torch.py / regex.py / transformers.py 或同名文件夹\n"
-            "  2) 确认网络正常，让程序自动完成 torch / transformers / safetensors 安装\n"
-            "  3) 若仍失败，再手动重建虚拟环境并重装依赖\n"
-            "  4) 最后确认模型名称是否正确"
-        )
-        raise RuntimeError(final_error_msg)
+        except Exception as cn_e:
+            final_error_msg = (
+                "CLIP 模型加载失败：\n"
+                f"  - sentence-transformers 尝试失败: {st_load_error}\n"
+                f"  - transformers 尝试失败: {tf_load_error}\n"
+                f"  - cn_clip 尝试失败: {cn_e}\n"
+                "建议按优先级排查：\n"
+                "  1) 安装/更新 safetensors + transformers（优先使用 safetensors 权重）\n"
+                "  2) 或安装 cn_clip 作为兜底（pip install cn_clip）\n"
+                "  3) 最后再考虑升级 torch>=2.6\n"
+                "并确认模型名称正确。"
+            )
+            raise RuntimeError(final_error_msg)
 
     @classmethod
     def clear_cache(cls):
@@ -8965,20 +8406,13 @@ class UniversalMatchThread(QThread):
                 is_visual_mode = s['is_img']; is_audio_mode = s['is_aud']
                 for r_idx, r in enumerate(res_data):
                     score = 0
-                    visual_sim = None
-                    audio_sim = None
-                    hash_sim = None
                     if not is_audio_mode:
                         if 'clip_feats' in s and 'clip_feats' in r:
                             sims = [np.dot(sf, rf) / (np.linalg.norm(sf) * np.linalg.norm(rf) + 1e-8) for sf in s['clip_feats'] for rf in r['clip_feats']]
-                            if sims:
-                                visual_sim = float(np.max(sims))
-                                score += visual_sim * 1000
+                            if sims: score += np.max(sims) * 1000
                         elif 'v_hashes' in s and 'v_hashes' in r:
                             dists = [sum(c1 != c2 for c1, c2 in zip(sh, rh)) for sh in s['v_hashes'] for rh in r['v_hashes']]
-                            if dists:
-                                hash_sim = float(1.0 - np.min(dists) / 256.0)
-                                score += hash_sim * 500
+                            if dists: score += (1.0 - np.min(dists) / 256.0) * 500
                     if not is_visual_mode:
                         if 'envelope' in s and s['envelope'] is not None and 'envelope' in r and r['envelope'] is not None:
                             env_s = s['envelope']; env_r = r['envelope']
@@ -8986,20 +8420,9 @@ class UniversalMatchThread(QThread):
                             corr = np.correlate(env_r, env_s, mode='valid')
                             if len(corr) > 0:
                                 wave_sim = np.max(corr) / (np.sqrt(np.sum(env_s**2) * np.max([np.sum(env_r[j:j+len(env_s)]**2) for j in range(len(corr))])) + 1e-8)
-                                audio_sim = float(wave_sim)
-                                score += audio_sim * 800
-                    if os.path.splitext(s['name'])[0].lower() == os.path.splitext(r['name'])[0].lower():
-                        score += 0.1
-                    reliable, reject_reason = is_universal_match_reliable(visual_sim=visual_sim, audio_sim=audio_sim, hash_sim=hash_sim)
-                    if score > 0 and reliable:
-                        all_pairs.append({
-                            's_idx': s_idx,
-                            'r_idx': r_idx,
-                            'score': score,
-                            'visual_sim': visual_sim,
-                            'audio_sim': audio_sim,
-                            'hash_sim': hash_sim,
-                        })
+                                score += wave_sim * 800
+                    if os.path.splitext(s['name'])[0].lower() == os.path.splitext(r['name'])[0].lower(): score += 0.1
+                    if score > 0: all_pairs.append({'s_idx': s_idx, 'r_idx': r_idx, 'score': score})
             all_pairs.sort(key=lambda x: x['score'], reverse=True)
             used_s = set(); used_r = set(); matches = []
             reused_image_count = 0
@@ -9022,20 +8445,13 @@ class UniversalMatchThread(QThread):
                     'res': res_data[p['r_idx']]['path'],
                     'score': p['score'],
                     'allow_src_reuse': allow_src_reuse,
-                    'match_ok': True,
-                    'visual_sim': p.get('visual_sim'),
-                    'audio_sim': p.get('audio_sim'),
-                    'hash_sim': p.get('hash_sim'),
                 })
-            unmatched_targets = max(0, len(res_data) - len(matches))
             self.progress.emit(100)
             self.result.emit(matches)
             if reused_image_count > 0:
                 self.log.emit(f"✅ 全局最优对位完成: {len(matches)} 组（其中 {reused_image_count} 组复用了同一图片来源）", "green")
             else:
                 self.log.emit(f"✅ 全局最优对位完成: {len(matches)} 组", "green")
-            if unmatched_targets > 0:
-                self.log.emit(f"[全能对位] 已跳过 {unmatched_targets} 个低置信度目标：未达到可靠匹配阈值，因此不会自动改名。", "orange")
         except Exception as e:
             err_msg = traceback.format_exc()
             self.log.emit(f"❌ UniversalMatchThread 发生严重错误: {e}\n{err_msg}", "red")
@@ -9055,153 +8471,13 @@ class VideoCopyMatchThread(QThread):
     AUDIO_EXTS = UniversalMatchThread.AUDIO_EXTS
     MEDIA_EXTS = VIDEO_EXTS + AUDIO_EXTS
 
-    def __init__(self, video_input, copy_items, clip_model_name="OFA-Sys/chinese-clip-vit-large-patch14", clip_use_gpu=True, ai_config=None, text_input=""):
+    def __init__(self, video_input, copy_items, clip_model_name="OFA-Sys/chinese-clip-vit-large-patch14", clip_use_gpu=True, ai_config=None):
         super().__init__()
         self.video_input = video_input
         self.copy_items = list(copy_items or [])
         self.clip_model_name = clip_model_name
         self.clip_use_gpu = clip_use_gpu
         self.ai_config = dict(ai_config or {})
-        self.text_input = str(text_input or "")
-
-    def _split_input_paths(self, path_input):
-        seen = set()
-        result = []
-        for raw in str(path_input or "").split('\n'):
-            p = str(raw or "").strip().strip('"').strip()
-            if not p or not os.path.exists(p):
-                continue
-            abs_p = os.path.abspath(p)
-            if abs_p in seen:
-                continue
-            seen.add(abs_p)
-            result.append(abs_p)
-        return result
-
-    def _belongs_to_root(self, path, root):
-        try:
-            return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
-        except Exception:
-            return False
-
-    def _infer_item_group_root(self, source_path, candidate_roots):
-        src = os.path.abspath(str(source_path or ""))
-        if not src:
-            return ""
-        roots = sorted([os.path.abspath(r) for r in (candidate_roots or [])], key=len, reverse=True)
-        for root in roots:
-            if self._belongs_to_root(src, root):
-                return root
-        return os.path.dirname(src)
-
-    def _build_media_groups(self):
-        groups = []
-        for path in self._split_input_paths(self.video_input):
-            if os.path.isfile(path):
-                if path.lower().endswith(self.MEDIA_EXTS):
-                    groups.append({
-                        "root": path,
-                        "label": os.path.basename(path),
-                        "media_files": [path],
-                    })
-                continue
-            media_files = self._collect_media_files(path)
-            if media_files:
-                groups.append({
-                    "root": path,
-                    "label": os.path.basename(path.rstrip(os.sep)) or path,
-                    "media_files": media_files,
-                })
-        return groups
-
-    def _build_text_groups(self, copy_items):
-        text_roots = self._split_input_paths(self.text_input)
-        grouped = {}
-        shared_items = []
-        for item in copy_items:
-            src_path = str(item.get("source_path", "") or "").strip()
-            if not src_path:
-                shared_items.append(item)
-                continue
-            owner_root = self._infer_item_group_root(src_path, text_roots)
-            grouped.setdefault(owner_root, []).append(item)
-        return text_roots, grouped, shared_items
-
-    def _pick_text_root_for_media_group(self, media_group, media_index, media_groups, text_roots):
-        media_root = os.path.abspath(str(media_group.get("root", "") or ""))
-        if not text_roots:
-            return ""
-        if len(text_roots) == 1:
-            return text_roots[0]
-        if media_root in text_roots:
-            return media_root
-        media_name = os.path.basename(media_root.rstrip(os.sep)).lower()
-        basename_matches = [root for root in text_roots if os.path.basename(root.rstrip(os.sep)).lower() == media_name]
-        if len(basename_matches) == 1:
-            return basename_matches[0]
-        if len(text_roots) == len(media_groups) and 0 <= media_index < len(text_roots):
-            return text_roots[media_index]
-        return ""
-
-    def _prepare_text_meta(self, copy_items):
-        text_meta = []
-        for idx, item in enumerate(copy_items):
-            try:
-                text = str(item.get("content", "")).strip()
-                text_meta.append({
-                    "name": clean_long_filename(item.get("name") or build_copy_match_name(text, idx + 1), max_len=80),
-                    "content": text,
-                })
-            except Exception as e:
-                self.log.emit(f"⚠️ 文案处理失败，已跳过第 {idx + 1} 段：{e}", "orange")
-        return text_meta
-
-    def _match_videos_against_texts(self, video_meta, text_meta, group_label=""):
-        results = []
-        label_prefix = f"[{group_label}] " if group_label else ""
-        for video in video_meta:
-            best_name = ""
-            best_text = ""
-            best_transcript = ""
-            best_sim = -1e9
-            second_best = -1e9
-            for txt in text_meta:
-                sim = score_transcript_against_copy(video["transcript"], txt["content"])
-                if sim > best_sim:
-                    second_best = best_sim
-                    best_sim = sim
-                    best_name = txt["name"]
-                    best_text = txt["content"]
-                    best_transcript = video["transcript"]
-                elif sim > second_best:
-                    second_best = sim
-            ok_match, threshold, reject_reason = is_copy_match_acceptable(
-                best_sim,
-                video["transcript"],
-                best_text,
-                second_best=second_best if second_best > -1e8 else None
-            )
-            final_score = round(best_sim * 100, 1)
-            if ok_match:
-                results.append({
-                    "src_label": best_name,
-                    "rename_name": best_name,
-                    "res": video["path"],
-                    "score": final_score,
-                    "srt_path": "",
-                    "tooltip": f"文件夹：{group_label or '未分组'}\n文案：{best_text}\n\n转写：{best_transcript[:500]}",
-                    "match_ok": True,
-                })
-                self.log.emit(
-                    f"{label_prefix}✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
-                    "green"
-                )
-            else:
-                self.log.emit(
-                    f"{label_prefix}⚠️ 跳过 {os.path.basename(video['path'])}：{reject_reason}，不自动改名",
-                    "orange"
-                )
-        return results
 
     def _collect_media_files(self, path_input):
         files = []
@@ -9494,100 +8770,141 @@ class VideoCopyMatchThread(QThread):
 
     def run(self):
         try:
+            video_paths = self._collect_media_files(self.video_input)
             copy_items = [item for item in self.copy_items if str(item.get("content", "")).strip()]
-            media_groups = self._build_media_groups()
-            if not media_groups:
+            if not video_paths:
                 self.error.emit("未找到可匹配的音频/视频文件")
                 return
             if not copy_items:
                 self.error.emit("没有可用文案，请至少填写 1 段文案")
                 return
 
-            text_roots, grouped_text_items, shared_text_items = self._build_text_groups(copy_items)
-            total_media = sum(len(g.get("media_files") or []) for g in media_groups)
-
             self.log.emit(
-                f"[音频文案匹配] 🎬 开始：{len(media_groups)} 个文件夹/分组，{total_media} 个音频/视频，共 {len(copy_items)} 段文案",
+                f"[音频文案匹配] 🎬 开始：{len(video_paths)} 个音频/视频 × {len(copy_items)} 段文案",
                 "blue"
             )
 
-            results = []
-            processed_media = 0
-            self.log.emit("[音频文案匹配] 当前采用按文件夹分别匹配：每个文件夹内部独立做“视频对文本”；同一文本名允许命中多个视频，重名自动追加 _2、_3。", "gray")
-            for group_index, media_group in enumerate(media_groups):
-                group_label = str(media_group.get("label", "") or f"分组{group_index + 1}")
-                media_files = list(media_group.get("media_files") or [])
-                group_root = str(media_group.get("root", "") or "")
-                text_root = self._pick_text_root_for_media_group(media_group, group_index, media_groups, text_roots)
-                group_copy_items = list(shared_text_items)
-                if text_root and text_root in grouped_text_items:
-                    group_copy_items.extend(grouped_text_items.get(text_root) or [])
-                elif group_root in grouped_text_items:
-                    group_copy_items.extend(grouped_text_items.get(group_root) or [])
-                if not group_copy_items and len(media_groups) == 1:
-                    group_copy_items = list(copy_items)
-
-                if not group_copy_items:
-                    self.log.emit(f"[{group_label}] ⚠️ 跳过：当前文件夹没有找到可用文本", "orange")
-                    processed_media += len(media_files)
-                    self.progress.emit(int(processed_media / max(1, total_media) * 60))
+            video_meta = []
+            total = len(video_paths)
+            for idx, path in enumerate(video_paths):
+                temp_audio = self._extract_audio_wav(path)
+                if not temp_audio:
+                    self.log.emit(f"⚠️ 跳过：无法提取音轨 {os.path.basename(path)}", "orange")
+                    self.progress.emit(int((idx + 1) / max(1, total) * 60))
                     continue
-
-                text_meta = self._prepare_text_meta(group_copy_items)
-                if not text_meta:
-                    self.log.emit(f"[{group_label}] ⚠️ 跳过：当前文件夹文本解析失败", "orange")
-                    processed_media += len(media_files)
-                    self.progress.emit(int(processed_media / max(1, total_media) * 60))
-                    continue
-
-                mapped_text_root = text_root or group_root
-                root_hint = f"；文本来源：{os.path.basename(str(mapped_text_root).rstrip(os.sep)) or mapped_text_root}" if mapped_text_root else ""
-                self.log.emit(f"[{group_label}] 开始匹配：{len(media_files)} 个音频/视频 × {len(text_meta)} 段文案{root_hint}", "blue")
-
-                video_meta = []
-                for path in media_files:
-                    temp_audio = self._extract_audio_wav(path)
-                    if not temp_audio:
-                        self.log.emit(f"[{group_label}] ⚠️ 跳过：无法提取音轨 {os.path.basename(path)}", "orange")
-                        processed_media += 1
-                        self.progress.emit(int(processed_media / max(1, total_media) * 60))
-                        continue
+                try:
+                    transcribed = self._transcribe_audio(temp_audio)
+                    transcript = str(transcribed.get("text", "") or "").strip()
+                    engine_used = str(transcribed.get("engine", "") or "").strip()
+                    video_meta.append({
+                        "path": path,
+                        "name": os.path.basename(path),
+                        "transcript": transcript,
+                        "engine": engine_used,
+                        "segments": transcribed.get("segments") or [],
+                    })
+                    self.log.emit(
+                        f"📝 已转写 {os.path.basename(path)} ({engine_used})：{smart_wrap_text(transcript[:80])}",
+                        "gray"
+                    )
+                except Exception as e:
+                    self.log.emit(f"⚠️ 跳过：{os.path.basename(path)} 转写失败：{e}", "orange")
+                finally:
                     try:
-                        transcribed = self._transcribe_audio(temp_audio)
-                        transcript = str(transcribed.get("text", "") or "").strip()
-                        engine_used = str(transcribed.get("engine", "") or "").strip()
-                        video_meta.append({
-                            "path": path,
-                            "name": os.path.basename(path),
-                            "transcript": transcript,
-                            "engine": engine_used,
-                            "segments": transcribed.get("segments") or [],
-                        })
-                        self.log.emit(
-                            f"[{group_label}] 📝 已转写 {os.path.basename(path)} ({engine_used})：{smart_wrap_text(transcript[:80])}",
-                            "gray"
-                        )
-                    except Exception as e:
-                        self.log.emit(f"[{group_label}] ⚠️ 跳过：{os.path.basename(path)} 转写失败：{e}", "orange")
-                    finally:
-                        try:
-                            if os.path.exists(temp_audio):
-                                os.remove(temp_audio)
-                        except Exception:
-                            pass
-                    processed_media += 1
-                    self.progress.emit(int(processed_media / max(1, total_media) * 60))
+                        if os.path.exists(temp_audio):
+                            os.remove(temp_audio)
+                    except Exception:
+                        pass
+                self.progress.emit(int((idx + 1) / max(1, total) * 60))
 
-                if not video_meta:
-                    self.log.emit(f"[{group_label}] ⚠️ 跳过：当前文件夹所有视频都无法完成音频转写", "orange")
-                    continue
-
-                results.extend(self._match_videos_against_texts(video_meta, text_meta, group_label=group_label))
-                self.progress.emit(60 + int((group_index + 1) / max(1, len(media_groups)) * 40))
-
-            if not results:
-                self.error.emit("所有文件夹都没有生成有效匹配结果，请检查每个文件夹内是否同时存在可转写的视频和可匹配的文本")
+            if not video_meta:
+                self.error.emit("所有视频都无法完成音频转写，无法进行文案匹配")
                 return
+
+            text_meta = []
+            for idx, item in enumerate(copy_items):
+                try:
+                    text = str(item.get("content", "")).strip()
+                    text_meta.append({
+                        "name": clean_long_filename(item.get("name") or build_copy_match_name(text, idx + 1), max_len=80),
+                        "content": text,
+                    })
+                except Exception as e:
+                    self.log.emit(f"⚠️ 文案处理失败，已跳过第 {idx + 1} 段：{e}", "orange")
+                self.progress.emit(60 + int((idx + 1) / max(1, len(copy_items)) * 10))
+
+            if not text_meta:
+                self.error.emit("文案处理失败，无法进行匹配")
+                return
+
+            many_to_one_mode = len(video_meta) > len(text_meta)
+            results = []
+
+            if many_to_one_mode:
+                self.log.emit("[音频文案匹配] 当前视频数量多于文案数量，将允许多个视频命中同一名称。", "gray")
+                for idx, video in enumerate(video_meta):
+                    best_name = ""
+                    best_text = ""
+                    best_transcript = ""
+                    best_sim = -1e9
+                    for txt in text_meta:
+                        sim = score_transcript_against_copy(video["transcript"], txt["content"])
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_name = txt["name"]
+                            best_text = txt["content"]
+                            best_transcript = video["transcript"]
+                    final_score = round(best_sim * 100, 1)
+                    results.append({
+                        "src_label": best_name,
+                        "rename_name": best_name,
+                        "res": video["path"],
+                        "score": final_score,
+                        "srt_path": "",
+                        "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
+                    })
+                    self.log.emit(
+                        f"✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
+                        "green"
+                    )
+                    self.progress.emit(70 + int((idx + 1) / max(1, len(video_meta)) * 30))
+            else:
+                import numpy as np
+                sims_matrix = []
+                for txt in text_meta:
+                    row = []
+                    for video in video_meta:
+                        row.append(score_transcript_against_copy(video["transcript"], txt["content"]))
+                    sims_matrix.append(row)
+                M = len(text_meta)
+                N = len(video_meta)
+                cols = max(M, N)
+                sims_matrix = np.array(sims_matrix, dtype=np.float32)
+                if cols != N:
+                    pad = np.full((M, cols - N), -1e9, dtype=np.float32)
+                    sims_matrix_pad = np.hstack([sims_matrix, pad])
+                else:
+                    sims_matrix_pad = sims_matrix
+                assign_cols = self._hungarian_min_cost((-sims_matrix_pad).tolist())
+                for i, j in enumerate(assign_cols):
+                    if j is None or j < 0 or j >= N:
+                        continue
+                    txt = text_meta[i]
+                    video = video_meta[j]
+                    final_score = round(float(sims_matrix[i, j]) * 100, 1)
+                    results.append({
+                        "src_label": txt["name"],
+                        "rename_name": txt["name"],
+                        "res": video["path"],
+                        "score": final_score,
+                        "srt_path": "",
+                        "tooltip": f"文案：{txt['content']}\n\n转写：{video['transcript'][:500]}",
+                    })
+                    self.log.emit(
+                        f"✅ {os.path.basename(video['path'])} → {txt['name']} (音频匹配得分: {final_score})",
+                        "green"
+                    )
+                    self.progress.emit(70 + int((i + 1) / max(1, M) * 30))
 
             results.sort(key=lambda x: str(x.get("res", "")).lower())
             self.progress.emit(100)
@@ -11264,28 +10581,17 @@ class VideoConcatBatchThread(QThread):
         try:
             from faster_whisper import WhisperModel
         except Exception as e:
-            self.log.emit("📦 检测到无人声裁剪缺少 faster-whisper，正在自动安装（仅首次或损坏后重装）...", "blue")
-            ok, install_info = _silent_install_libs_once(
-                ["faster_whisper"],
-                timeout=1200,
-                log_prefix="[NO-VOICE]",
-                state_key="faster_whisper",
-                import_probe_modules=["faster_whisper"],
-            )
+            self.log.emit("📦 检测到无人声裁剪缺少 faster-whisper，正在首次自动安装...", "blue")
+            ok = _silent_install_libs(["faster_whisper"], timeout=1200, log_prefix="[NO-VOICE]")
             if not ok:
                 self._concat_voice_model_failed = True
-                detail = str((install_info or {}).get("error", "") or e).strip()
-                self.log.emit(f"⚠️ faster-whisper 自动安装失败，已跳过无人声裁剪：{detail}", "orange")
+                self.log.emit(f"⚠️ faster-whisper 自动安装失败，已跳过无人声裁剪：{e}", "orange")
                 return None
             try:
                 from faster_whisper import WhisperModel
-                if (install_info or {}).get("cached"):
-                    self.log.emit("ℹ️ faster-whisper 已安装，跳过重复安装", "gray")
-                else:
-                    self.log.emit("✅ faster-whisper 自动安装完成，继续执行无人声裁剪", "green")
+                self.log.emit("✅ faster-whisper 自动安装完成，继续执行无人声裁剪", "green")
             except Exception as e2:
                 self._concat_voice_model_failed = True
-                _mark_runtime_install_failed("faster_whisper", error=str(e2), package_names=["faster_whisper"], extra={"last_label": "[NO-VOICE]"})
                 self.log.emit(f"⚠️ faster-whisper 安装后仍不可用，已跳过无人声裁剪：{e2}", "orange")
                 return None
         device_candidates = [("cpu", "int8")]
@@ -12024,9 +11330,12 @@ class ConcatSourceTable(QTableWidget):
             rows = sorted({it.row() for it in items if it})
         text_rows = []
         for row in rows:
-            item = self.item(row, 0)
-            if item and item.text().strip():
-                text_rows.append(item.text().strip())
+            index_item = self.item(row, 0)
+            name_item = self.item(row, 1)
+            idx_text = index_item.text().strip() if index_item else ""
+            name_text = name_item.text().strip() if name_item else ""
+            if idx_text:
+                text_rows.append(f"{name_text} ({idx_text})" if name_text else idx_text)
         data = QMimeData()
         data.setText("\n".join(text_rows))
         return data
@@ -12036,6 +11345,7 @@ class ConcatGroupTable(QTableWidget):
     def __init__(self, rows=12, material_cols=8, parent=None):
         super().__init__(rows, 1 + material_cols, parent)
         self.material_cols = material_cols
+        self.token_display_resolver = None
         self.setHorizontalHeaderLabels(["输出名"] + [f"素材{i}" for i in range(1, material_cols + 1)])
         self.verticalHeader().setVisible(False)
         self.setAcceptDrops(True)
@@ -12094,7 +11404,14 @@ class ConcatGroupTable(QTableWidget):
             if not item:
                 item = QTableWidgetItem("")
                 self.setItem(row, target_col, item)
-            item.setText(token)
+            display_token = token
+            resolver = getattr(self, "token_display_resolver", None)
+            if callable(resolver):
+                try:
+                    display_token = resolver(token)
+                except Exception:
+                    display_token = token
+            item.setText(display_token)
         self.setCurrentCell(row, min(self.columnCount() - 1, col + len(tokens) - 1))
         event.acceptProposedAction()
 
@@ -14407,11 +13724,6 @@ class VideoConcatTab(QWidget):
         self.concat_include_single_folder_check.setToolTip("勾选后，智能组合时只有 1 个视频的文件夹也会生成任务，执行时直接整理到输出目录")
         self.concat_include_single_folder_check.toggled.connect(self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit)
         table_top_btns.addWidget(self.concat_include_single_folder_check)
-        self.concat_skip_incomplete_folder_check = QCheckBox("缺失同名 txt 视频时跳过文件夹")
-        self.concat_skip_incomplete_folder_check.setChecked(False)
-        self.concat_skip_incomplete_folder_check.setToolTip("勾选后，会先检查文件夹内的 txt 是否都有同名视频；若存在缺失素材，则该文件夹不会生成拼接任务")
-        self.concat_skip_incomplete_folder_check.toggled.connect(self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit)
-        table_top_btns.addWidget(self.concat_skip_incomplete_folder_check)
         table_top_btns.addStretch()
         rule_layout.addLayout(table_top_btns)
 
@@ -14430,7 +13742,9 @@ class VideoConcatTab(QWidget):
         group_v.setContentsMargins(0, 0, 0, 0)
         group_v.addWidget(QLabel("组合表（每行一个成片）"))
         self.concat_group_table = ConcatGroupTable(rows=12, material_cols=8)
+        self.concat_group_table.token_display_resolver = self._format_concat_group_token_for_display
         self.concat_group_table.itemChanged.connect(lambda *_: self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit())
+        self.concat_group_table.itemChanged.connect(self._on_concat_group_table_item_changed)
         group_v.addWidget(self.concat_group_table)
         table_split.addWidget(group_wrap)
         table_split.setStretchFactor(0, 2)
@@ -16696,6 +16010,65 @@ class VideoConcatTab(QWidget):
             table.setItem(row, 0, QTableWidgetItem(str(idx)))
             table.setItem(row, 1, QTableWidgetItem(os.path.basename(path)))
             table.setItem(row, 2, QTableWidgetItem(path))
+        self._refresh_concat_group_table_labels()
+
+    def _format_concat_material_label(self, path, idx=""):
+        name = os.path.basename(path or "").strip()
+        idx_text = str(idx or "").strip()
+        if name and idx_text:
+            return f"{name} ({idx_text})"
+        return name or idx_text
+
+    def _format_concat_group_token_for_display(self, token):
+        raw = str(token or "").strip()
+        if not raw:
+            return ""
+        videos = self._collect_videos()
+        if not videos:
+            return raw
+        refs = self._build_video_refs(videos)
+        resolved, err = self._resolve_group_token(raw, refs)
+        if err or not resolved:
+            return raw
+        idx = refs.get("path_to_index", {}).get(os.path.normcase(os.path.abspath(resolved)), "")
+        return self._format_concat_material_label(resolved, idx)
+
+    def _refresh_concat_group_table_labels(self):
+        table = getattr(self, "concat_group_table", None)
+        if not table:
+            return
+        table.blockSignals(True)
+        try:
+            for row in range(table.rowCount()):
+                for col in range(1, table.columnCount()):
+                    item = table.item(row, col)
+                    if not item:
+                        continue
+                    raw = item.text().strip()
+                    if not raw:
+                        continue
+                    pretty = self._format_concat_group_token_for_display(raw)
+                    if pretty and pretty != raw:
+                        item.setText(pretty)
+        finally:
+            table.blockSignals(False)
+
+    def _on_concat_group_table_item_changed(self, item):
+        if getattr(self, "_concat_group_table_formatting", False):
+            return
+        if not item or item.column() < 1:
+            return
+        raw = item.text().strip()
+        if not raw:
+            return
+        pretty = self._format_concat_group_token_for_display(raw)
+        if not pretty or pretty == raw:
+            return
+        self._concat_group_table_formatting = True
+        try:
+            item.setText(pretty)
+        finally:
+            self._concat_group_table_formatting = False
 
     def add_concat_table_row(self):
         row = self.concat_group_table.rowCount()
@@ -16726,7 +16099,7 @@ class VideoConcatTab(QWidget):
         src_item = self.concat_source_table.item(row, 0)
         if not src_item:
             return
-        token = src_item.text().strip()
+        token = self._format_concat_group_token_for_display(src_item.text().strip())
         current_row = self.concat_group_table.currentRow()
         current_col = self.concat_group_table.currentColumn()
         if current_row < 0:
@@ -16761,6 +16134,8 @@ class VideoConcatTab(QWidget):
             row_vals = data[r] if r < len(data) and isinstance(data[r], list) else []
             for c in range(self.concat_group_table.columnCount()):
                 val = str(row_vals[c]) if c < len(row_vals) else ""
+                if c >= 1 and val:
+                    val = self._format_concat_group_token_for_display(val)
                 self.concat_group_table.setItem(r, c, QTableWidgetItem(val))
         self.concat_group_table.blockSignals(False)
 
@@ -16929,93 +16304,26 @@ class VideoConcatTab(QWidget):
         check = getattr(self, "concat_include_single_folder_check", None)
         return bool(check and check.isChecked())
 
-    def _concat_skip_incomplete_folder_enabled(self):
-        check = getattr(self, "concat_skip_incomplete_folder_check", None)
-        return bool(check and check.isChecked())
-
-    def _find_missing_txt_video_pairs(self, folder):
-        if not folder or not os.path.isdir(folder):
-            return []
-        try:
-            entries = os.listdir(folder)
-        except Exception:
-            return []
-        video_stems = set()
-        txt_stems = set()
-        for name in entries:
-            full_path = os.path.join(folder, name)
-            if not os.path.isfile(full_path):
-                continue
-            stem, ext = os.path.splitext(name)
-            ext_lower = ext.lower()
-            if ext_lower in self.VIDEO_EXTS:
-                video_stems.add(stem.lower())
-            elif ext_lower == ".txt":
-                stem_text = stem.strip()
-                if re.fullmatch(r"\d+", stem_text):
-                    txt_stems.add(stem_text.lower())
-        missing = [stem for stem in txt_stems if stem not in video_stems]
-        return sorted(missing, key=self._natural_sort_key)
-
-    def _filter_concat_leaf_folder_groups(self, folder_groups):
-        """
-        只保留“最子级”的视频文件夹：
-        - 如果 A 文件夹下面还有更深层的 B 文件夹也包含视频，
-          那么 A 不参与自动拼合，只保留 B。
-        """
-        if not folder_groups:
-            return {}
-        normalized_folders = [os.path.normcase(os.path.abspath(folder)) for folder in folder_groups.keys() if folder]
-        leaf_groups = {}
-        for folder, paths in folder_groups.items():
-            abs_folder = os.path.normcase(os.path.abspath(folder))
-            prefix = abs_folder + os.sep
-            has_child_video_folder = any(other != abs_folder and other.startswith(prefix) for other in normalized_folders)
-            if not has_child_video_folder:
-                leaf_groups[folder] = paths
-        return leaf_groups
-
     def auto_fill_concat_groups_by_folder(self):
         videos = self._collect_videos()
         if not videos:
             QMessageBox.warning(self, "提示", "请先添加至少 1 个有效视频素材")
             return
         allow_single = self._concat_allow_single_video_output()
-        skip_incomplete = self._concat_skip_incomplete_folder_enabled()
         folder_groups = {}
         for path in videos:
             folder = os.path.dirname(path)
             folder_groups.setdefault(folder, []).append(path)
-        folder_groups = self._filter_concat_leaf_folder_groups(folder_groups)
         valid_groups = []
         single_group_count = 0
-        skipped_incomplete = []
         for folder, paths in folder_groups.items():
             ordered = sorted(paths, key=self._natural_sort_key)
-            if skip_incomplete:
-                missing_stems = self._find_missing_txt_video_pairs(folder)
-                if missing_stems:
-                    skipped_incomplete.append((folder, missing_stems))
-                    continue
             if len(ordered) >= 2 or (allow_single and len(ordered) == 1):
                 valid_groups.append((folder, ordered))
                 if len(ordered) == 1:
                     single_group_count += 1
         valid_groups.sort(key=lambda item: self._natural_sort_key(item[0]))
         if not valid_groups:
-            if skipped_incomplete:
-                sample_lines = []
-                for folder, missing_stems in skipped_incomplete[:5]:
-                    sample_lines.append(f"{os.path.basename(folder) or folder}：缺少 {', '.join(missing_stems[:5])}")
-                extra = "\n".join(sample_lines)
-                if len(skipped_incomplete) > 5:
-                    extra += "\n……"
-                QMessageBox.warning(
-                    self,
-                    "提示",
-                    f"没有生成可用的拼接任务：共跳过 {len(skipped_incomplete)} 个素材不完整的文件夹。\n{extra}"
-                )
-                return
             if allow_single:
                 QMessageBox.warning(self, "提示", "没有找到可自动整理的文件夹组，请先确认视频素材是否有效。")
             else:
@@ -17045,35 +16353,38 @@ class VideoConcatTab(QWidget):
             used_names.add(output_name)
             table.setItem(row, 0, QTableWidgetItem(output_name))
             for col, path in enumerate(paths, 1):
-                token = path_to_index.get(os.path.normcase(os.path.abspath(path)), "")
+                token = self._format_concat_material_label(
+                    path,
+                    path_to_index.get(os.path.normcase(os.path.abspath(path)), "")
+                )
                 table.setItem(row, col, QTableWidgetItem(token))
         table.blockSignals(False)
         self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit()
         if single_group_count:
-            msg = f"已按文件夹顺序生成 {len(valid_groups)} 组任务，其中 {single_group_count} 组为单视频，将在执行时直接整理到输出目录。"
+            QMessageBox.information(
+                self,
+                "智能组合完成",
+                f"已按文件夹顺序生成 {len(valid_groups)} 组任务，其中 {single_group_count} 组为单视频，将在执行时直接整理到输出目录。"
+            )
         else:
-            msg = f"已按文件夹顺序生成 {len(valid_groups)} 组拼接任务。"
-        if skipped_incomplete:
-            sample_lines = []
-            for folder, missing_stems in skipped_incomplete[:5]:
-                sample_lines.append(f"{os.path.basename(folder) or folder}：缺少 {', '.join(missing_stems[:5])}")
-            msg += f"\n\n另外已跳过 {len(skipped_incomplete)} 个素材不完整的文件夹：\n" + "\n".join(sample_lines)
-            if len(skipped_incomplete) > 5:
-                msg += "\n……"
-        QMessageBox.information(self, "智能组合完成", msg)
+            QMessageBox.information(self, "智能组合完成", f"已按文件夹顺序生成 {len(valid_groups)} 组拼接任务。")
 
     def _build_video_refs(self, videos):
         refs = {
             "index": {},
             "basename": {},
             "stem": {},
-            "full": {}
+            "full": {},
+            "path_to_index": {}
         }
         for idx, path in enumerate(videos, 1):
-            refs["index"][str(idx)] = path
+            idx_text = str(idx)
+            norm_path = os.path.normcase(os.path.abspath(path))
+            refs["index"][idx_text] = path
             base = os.path.basename(path).lower()
             stem = os.path.splitext(base)[0]
-            refs["full"][os.path.normcase(os.path.abspath(path))] = path
+            refs["full"][norm_path] = path
+            refs["path_to_index"][norm_path] = idx_text
             refs["basename"].setdefault(base, []).append(path)
             refs["stem"].setdefault(stem, []).append(path)
         return refs
@@ -17082,6 +16393,12 @@ class VideoConcatTab(QWidget):
         raw = str(token or "").strip().strip('"').strip("'")
         if not raw:
             return None, "存在空素材项"
+        normalized = raw.replace("（", "(").replace("）", ")")
+        match = re.search(r"\((\d+)\)\s*$", normalized)
+        if match:
+            idx_text = match.group(1)
+            p = refs["index"].get(idx_text)
+            return (p, None) if p else (None, f"编号 {idx_text} 不存在")
         if raw.isdigit():
             p = refs["index"].get(raw)
             return (p, None) if p else (None, f"编号 {raw} 不存在")
@@ -21966,23 +21283,12 @@ class FileManagerPro(QMainWindow):
             self.btn_uni_run_srt_only.setText(" 📝 生成字幕文件 ")
 
     def install_faster_whisper_for_match(self):
-        ok, install_info = _silent_install_libs_once(
-            ["faster_whisper"],
-            timeout=1200,
-            log_prefix="[ASR]",
-            state_key="faster_whisper",
-            import_probe_modules=["faster_whisper"],
-        )
+        ok = _silent_install_libs(["faster_whisper"], timeout=1200, log_prefix="[ASR]")
         if ok:
-            if (install_info or {}).get("cached"):
-                QMessageBox.information(self, "已就绪", "faster-whisper 之前已经安装过，本次已直接跳过重复安装。")
-                self.log("[音频转写] ℹ️ faster-whisper 已安装，跳过重复安装", "gray")
-            else:
-                QMessageBox.information(self, "安装完成", "faster-whisper 已安装完成，现在可以直接执行音频/视频对白对文本匹配。")
-                self.log("[音频转写] ✅ faster-whisper 安装完成", "green")
+            QMessageBox.information(self, "安装完成", "faster-whisper 已安装完成，现在可以直接执行音频/视频对白对文本匹配。")
+            self.log("[音频转写] ✅ faster-whisper 安装完成", "green")
         else:
-            detail = str((install_info or {}).get("error", "") or "请检查网络或权限，或稍后重试。")
-            QMessageBox.warning(self, "安装失败", f"faster-whisper 自动安装失败。\n\n{detail}")
+            QMessageBox.warning(self, "安装失败", "faster-whisper 自动安装失败。请检查网络或权限，或稍后重试。")
             self.log("[音频转写] ❌ faster-whisper 自动安装失败", "red")
 
     def run_universal_match(self):
@@ -22028,8 +21334,7 @@ class FileManagerPro(QMainWindow):
             copy_items,
             clip_model_name=clip_model_name,
             clip_use_gpu=clip_use_gpu,
-            ai_config=ai_cfg,
-            text_input=text_source
+            ai_config=ai_cfg
         )
         self.uni_copy_match_thread.progress.connect(self.uni_progress_bar.setValue)
         self.uni_copy_match_thread.log.connect(self.log)
@@ -22112,7 +21417,7 @@ class FileManagerPro(QMainWindow):
         self.uni_txt_export_thread.error.connect(lambda msg: (self.log(msg, "red"), QMessageBox.critical(self, "TXT生成失败", msg)))
         self.uni_txt_export_thread.start()
 
-    def _append_universal_match_row(self, src_label, res_label, score_value, src_abs="", res_abs="", rename_name="", tooltip="", srt_label="", srt_abs="", txt_label="", txt_abs="", allow_rename=True, skip_reason=""):
+    def _append_universal_match_row(self, src_label, res_label, score_value, src_abs="", res_abs="", rename_name="", tooltip="", srt_label="", srt_abs="", txt_label="", txt_abs=""):
         row = self.uni_match_table.rowCount()
         self.uni_match_table.insertRow(row)
         display_name = str(src_label or rename_name or "")
@@ -22126,8 +21431,6 @@ class FileManagerPro(QMainWindow):
         it_src.setData(_UserRole + 1, stored_rename_name)
         it_src.setData(_UserRole + 2, srt_abs or "")
         it_src.setData(_UserRole + 3, txt_abs or "")
-        it_src.setData(_UserRole + 4, bool(allow_rename))
-        it_src.setData(_UserRole + 5, str(skip_reason or ""))
         it_res.setData(_UserRole, res_abs)
         if tooltip:
             try:
@@ -22168,15 +21471,13 @@ class FileManagerPro(QMainWindow):
                 rename_name="",
                 mode_override="general"
             ) or os.path.splitext(os.path.basename(m.get('src', '') or src_rel))[0]
-            res_dir_key = os.path.abspath(os.path.dirname(str(m.get('res', '') or ""))) if str(m.get('res', '') or "").strip() else ""
-            count_key = (res_dir_key, str(base_rename_name or "").strip())
-            seq = rename_name_counts.get(count_key, 0) + 1
-            rename_name_counts[count_key] = seq
+            seq = rename_name_counts.get(base_rename_name, 0) + 1
+            rename_name_counts[base_rename_name] = seq
             rename_name = base_rename_name if seq == 1 else f"{base_rename_name}_{seq}"
             res_ext = os.path.splitext(str(m.get('res', '') or res_rel))[1]
             display_name = f"{rename_name}{res_ext}" if rename_name and res_ext else (rename_name or src_rel)
             tooltip = f"来源：{src_rel}\n目标：{res_rel}"
-            self._append_universal_match_row(display_name, res_rel, m.get('score', ''), src_abs=m.get('src', ''), res_abs=m.get('res', ''), rename_name=rename_name, tooltip=tooltip, srt_label="", srt_abs="", txt_label="", txt_abs="", allow_rename=bool(m.get('match_ok', True)), skip_reason=str(m.get('skip_reason', '') or ''))
+            self._append_universal_match_row(display_name, res_rel, m.get('score', ''), src_abs=m.get('src', ''), res_abs=m.get('res', ''), rename_name=rename_name, tooltip=tooltip, srt_label="", srt_abs="", txt_label="", txt_abs="")
 
     def display_video_copy_match_results(self, matches):
         self._last_universal_match_results = list(matches or [])
@@ -22186,7 +21487,6 @@ class FileManagerPro(QMainWindow):
         res_base = self.uni_match_res_input.text().split('\n')[0]
         res_base = res_base if os.path.isdir(res_base) else os.path.dirname(res_base)
         name_pref = self.get_universal_match_name_source_mode()
-        rename_name_counts = {}
         for m in matches:
             try:
                 res_rel = os.path.relpath(m['res'], res_base)
@@ -22218,13 +21518,7 @@ class FileManagerPro(QMainWindow):
                     rename_name=raw_text_name,
                     mode_override="audio_text"
                 )
-            base_rename_name = base_rename_name or raw_text_name
-            res_dir_key = os.path.abspath(os.path.dirname(str(m.get('res', '') or ""))) if str(m.get('res', '') or "").strip() else ""
-            count_key = (res_dir_key, str(base_rename_name or "").strip())
-            seq = rename_name_counts.get(count_key, 0) + 1 if base_rename_name else 1
-            if base_rename_name:
-                rename_name_counts[count_key] = seq
-            rename_name = base_rename_name if (not base_rename_name or seq == 1) else f"{base_rename_name}_{seq}"
+            rename_name = base_rename_name or raw_text_name
             res_ext = os.path.splitext(str(m.get('res', '') or res_rel))[1]
             is_rename_preview = bool(rename_name) and not srt_abs and not txt_abs
             display_label = f"{rename_name}{res_ext}" if is_rename_preview and res_ext else (rename_name if is_rename_preview else (m.get('src_label', '') or rename_name))
@@ -22239,9 +21533,7 @@ class FileManagerPro(QMainWindow):
                 srt_label=srt_rel,
                 srt_abs=srt_abs,
                 txt_label=txt_rel,
-                txt_abs=txt_abs,
-                allow_rename=bool(m.get('match_ok', True)),
-                skip_reason=str(m.get('skip_reason', '') or '')
+                txt_abs=txt_abs
             )
 
     def _resolve_universal_match_abs_path(self, item, base_input_text=""):
@@ -22296,15 +21588,6 @@ class FileManagerPro(QMainWindow):
             if not os.path.exists(res_abs):
                 skipped += 1
                 self.log(f"[全能对位] 跳过第 {i+1} 行：找不到目标文件 -> {res_abs}", "orange")
-                continue
-            allow_rename = bool(it_src.data(_UserRole + 4)) if it_src.data(_UserRole + 4) is not None else True
-            skip_reason = str(it_src.data(_UserRole + 5) or "").strip()
-            score_item = self.uni_match_table.item(i, 2)
-            score_text = score_item.text().strip() if score_item else ""
-            auto_skip, auto_skip_reason = should_skip_universal_rename(score_text, getattr(self, '_last_universal_match_result_kind', 'general'))
-            if (not allow_rename) or auto_skip:
-                skipped += 1
-                self.log(f"[全能对位] 第 {i+1} 行已跳过：{skip_reason or auto_skip_reason or '未达到自动重命名阈值'}", "orange")
                 continue
             rename_name = str(it_src.data(_UserRole + 1) or "").strip()
             if not rename_name:
@@ -25816,88 +25099,8 @@ class FileManagerPro(QMainWindow):
         self.trigger_save()
 
     def setup_renamer_tab(self):
-        layout = QVBoxLayout(self.renamer_tab)
-
-        direct_tip = QLabel(
-            "可直接拖拽文件/文件夹到下方表格，也可以用按钮添加；不需要先走 CSV 匹配。"
-            "表格已拆成前缀 / 主文件名 / 后缀 / 扩展名，改名时会分别组合，避免误改后缀。"
-        )
-        direct_tip.setWordWrap(True)
-        direct_tip.setStyleSheet("color:#1d4ed8; background:#eff6ff; padding:8px; border-radius:6px;")
-        layout.addWidget(direct_tip)
-
-        source_layout = QHBoxLayout()
-        btn_add_files = QPushButton("添加文件")
-        btn_add_files.clicked.connect(self.renamer_pick_files)
-        source_layout.addWidget(btn_add_files)
-        btn_add_folder = QPushButton("添加文件夹")
-        btn_add_folder.clicked.connect(self.renamer_pick_folder)
-        source_layout.addWidget(btn_add_folder)
-        source_layout.addStretch()
-        layout.addLayout(source_layout)
-
-        tool_layout = QHBoxLayout()
-        tool_layout.addWidget(QLabel("查找:"))
-        self.find_input = QLineEdit()
-        tool_layout.addWidget(self.find_input)
-        tool_layout.addWidget(QLabel("替换:"))
-        self.replace_input = QLineEdit()
-        tool_layout.addWidget(self.replace_input)
-        self.regex_check = QCheckBox("正则")
-        tool_layout.addWidget(self.regex_check)
-        btn_replace = QPushButton("替换")
-        btn_replace.clicked.connect(self.renamer_batch_replace)
-        tool_layout.addWidget(btn_replace)
-        tool_layout.addSpacing(12)
-        tool_layout.addWidget(QLabel("添加字段:"))
-        self.renamer_insert_text_input = QLineEdit()
-        self.renamer_insert_text_input.setPlaceholderText("例如：项目A / 成片 / 202607")
-        tool_layout.addWidget(self.renamer_insert_text_input)
-        tool_layout.addWidget(QLabel("添加到:"))
-        self.renamer_insert_pos_combo = QComboBox()
-        self.renamer_insert_pos_combo.addItems(["前缀", "后缀"])
-        tool_layout.addWidget(self.renamer_insert_pos_combo)
-        btn_insert_text = QPushButton("应用")
-        btn_insert_text.clicked.connect(self.renamer_apply_insert_text)
-        tool_layout.addWidget(btn_insert_text)
-        layout.addLayout(tool_layout)
-
-        num_layout = QHBoxLayout()
-        num_layout.addWidget(QLabel("前删:"))
-        self.del_front_spin = QSpinBox()
-        num_layout.addWidget(self.del_front_spin)
-        btn_del_f = QPushButton("执行")
-        btn_del_f.clicked.connect(self.renamer_del_front)
-        num_layout.addWidget(btn_del_f)
-        num_layout.addSpacing(10)
-        num_layout.addWidget(QLabel("后删:"))
-        self.del_back_spin = QSpinBox()
-        num_layout.addWidget(self.del_back_spin)
-        btn_del_b = QPushButton("执行")
-        btn_del_b.clicked.connect(self.renamer_del_back)
-        num_layout.addWidget(btn_del_b)
-        num_layout.addSpacing(10)
-        num_layout.addWidget(QLabel("自动编号到:"))
-        self.renamer_number_target_combo = QComboBox()
-        self.renamer_number_target_combo.addItems(["前缀", "主文件名", "后缀"])
-        self.renamer_number_target_combo.setCurrentText("前缀")
-        num_layout.addWidget(self.renamer_number_target_combo)
-        num_layout.addStretch()
-        btn_num = QPushButton("🔢 自动编号")
-        btn_num.clicked.connect(self.renamer_auto_number)
-        num_layout.addWidget(btn_num)
-        btn_restore = QPushButton("↩️ 还原")
-        btn_restore.clicked.connect(self.renamer_restore_original)
-        num_layout.addWidget(btn_restore)
-        self.btn_undo_rename = QPushButton("撤回上次改名")
-        self.btn_undo_rename.setEnabled(False)
-        self.btn_undo_rename.clicked.connect(self.run_undo_rename)
-        num_layout.addWidget(self.btn_undo_rename)
-        btn_clear = QPushButton("🗑️ 清空")
-        btn_clear.clicked.connect(self.renamer_clear)
-        num_layout.addWidget(btn_clear)
-        layout.addLayout(num_layout)
-
+        layout = QVBoxLayout(self.renamer_tab); tool_layout = QHBoxLayout(); tool_layout.addWidget(QLabel("查找:")); self.find_input = QLineEdit(); tool_layout.addWidget(self.find_input); tool_layout.addWidget(QLabel("替换:")); self.replace_input = QLineEdit(); tool_layout.addWidget(self.replace_input); self.regex_check = QCheckBox("正则"); tool_layout.addWidget(self.regex_check); btn_replace = QPushButton("替换"); btn_replace.clicked.connect(self.renamer_batch_replace); tool_layout.addWidget(btn_replace); layout.addLayout(tool_layout)
+        num_layout = QHBoxLayout(); num_layout.addWidget(QLabel("前删:")); self.del_front_spin = QSpinBox(); num_layout.addWidget(self.del_front_spin); btn_del_f = QPushButton("执行"); btn_del_f.clicked.connect(self.renamer_del_front); num_layout.addWidget(btn_del_f); num_layout.addSpacing(10); num_layout.addWidget(QLabel("后删:")); self.del_back_spin = QSpinBox(); num_layout.addWidget(self.del_back_spin); btn_del_b = QPushButton("执行"); btn_del_b.clicked.connect(self.renamer_del_back); num_layout.addWidget(btn_del_b); num_layout.addStretch(); btn_num = QPushButton("🔢 自动编号"); btn_num.clicked.connect(self.renamer_auto_number); num_layout.addWidget(btn_num); btn_restore = QPushButton("↩️ 还原"); btn_restore.clicked.connect(self.renamer_restore_original); num_layout.addWidget(btn_restore); self.btn_undo_rename = QPushButton("撤回上次改名"); self.btn_undo_rename.setEnabled(False); self.btn_undo_rename.clicked.connect(self.run_undo_rename); num_layout.addWidget(self.btn_undo_rename); btn_clear = QPushButton("🗑️ 清空"); btn_clear.clicked.connect(self.renamer_clear); num_layout.addWidget(btn_clear); layout.addLayout(num_layout)
         # 智能改名区域
         smart_rename_group = QGroupBox("智能改名 (通过 CSV 匹配)"); smart_rename_layout = QVBoxLayout(smart_rename_group)
         
@@ -25909,27 +25112,7 @@ class FileManagerPro(QMainWindow):
         layout.addWidget(smart_rename_group)
 
         # 原有的批量重命名 UI
-        self.rename_table = ExcelTable(0, 5)
-        self.rename_table.setObjectName("rename_table")
-        self.rename_table.setHorizontalHeaderLabels(["原始路径", "前缀", "主文件名", "后缀", "扩展名"])
-        self.rename_table.horizontalHeader().setStretchLastSection(False)
-        _interactive = QHeaderView.ResizeMode.Interactive if PYQT_VERSION == 6 else QHeaderView.Interactive
-        for col in range(5):
-            self.rename_table.horizontalHeader().setSectionResizeMode(col, _interactive)
-        self.rename_table.setColumnWidth(0, 520)
-        self.rename_table.setColumnWidth(1, 120)
-        self.rename_table.setColumnWidth(2, 220)
-        self.rename_table.setColumnWidth(3, 120)
-        self.rename_table.setColumnWidth(4, 90)
-        layout.addWidget(self.rename_table)
-        btn_exec_layout = QHBoxLayout()
-        btn_exec_layout.addWidget(QLabel("说明：前缀/主文件名/后缀会自动拼成新文件名，扩展名单独控制。"))
-        btn_exec_layout.addStretch()
-        btn_exec = QPushButton(" 🚀 执行重命名 ")
-        btn_exec.setObjectName("action_btn")
-        btn_exec.clicked.connect(self.renamer_execute)
-        btn_exec_layout.addWidget(btn_exec)
-        layout.addLayout(btn_exec_layout)
+        self.rename_table = ExcelTable(0, 3); self.rename_table.setObjectName("rename_table"); self.rename_table.setHorizontalHeaderLabels(["原始路径", "前缀", "主文件名"]); self.rename_table.horizontalHeader().setStretchLastSection(True); layout.addWidget(self.rename_table); btn_exec_layout = QHBoxLayout(); self.ext_check = QCheckBox("包含后缀名"); self.ext_check.toggled.connect(self.renamer_toggle_ext); btn_exec_layout.addWidget(self.ext_check); btn_exec_layout.addStretch(); btn_exec = QPushButton(" 🚀 执行重命名 "); btn_exec.setObjectName("action_btn"); btn_exec.clicked.connect(self.renamer_execute); btn_exec_layout.addWidget(btn_exec); layout.addLayout(btn_exec_layout)
     def _get_browse_start_dir(self, line_edit=None):
         """浏览目录/文件时，优先从当前输入框已有路径打开，其次回退到上次浏览位置。"""
         candidates = []
@@ -27147,31 +26330,6 @@ class FileManagerPro(QMainWindow):
             return f"{prefix}-{main}"
         return prefix or main
 
-    def _compose_renamer_full_stem(self, prefix_text, main_text, suffix_text=""):
-        base = self._compose_renamer_stem(prefix_text, main_text)
-        suffix = (suffix_text or "").strip()
-        if base and suffix:
-            return f"{base}-{suffix}"
-        return base or suffix
-
-    def _normalize_renamer_ext(self, ext_text, original_ext=""):
-        raw = str(ext_text or "").strip()
-        if not raw:
-            return original_ext or ""
-        raw = raw.replace("。", ".").replace("．", ".").strip()
-        if raw.startswith("."):
-            return raw
-        return "." + raw.lstrip(".")
-
-    def _split_renamer_filename(self, file_path):
-        fname = os.path.basename(file_path or "")
-        stem, ext = os.path.splitext(fname)
-        return "", stem, "", ext.lstrip(".")
-
-    def _renamer_item_text(self, row, col):
-        item = self.rename_table.item(row, col)
-        return item.text().strip() if item else ""
-
     def _find_best_rename_code_match(self, name_without_ext, csv_mapping):
         """
         从文件名中寻找最合适的代码匹配：
@@ -27274,10 +26432,8 @@ class FileManagerPro(QMainWindow):
                     row = self.rename_table.rowCount()
                     self.rename_table.insertRow(row)
                     self.rename_table.setItem(row, 0, QTableWidgetItem(original_path))
-                    self.rename_table.setItem(row, 1, QTableWidgetItem(""))
-                    self.rename_table.setItem(row, 2, QTableWidgetItem(new_name_without_ext))
-                    self.rename_table.setItem(row, 3, QTableWidgetItem(""))
-                    self.rename_table.setItem(row, 4, QTableWidgetItem(ext.lstrip(".")))
+                    self.rename_table.setItem(row, 1, QTableWidgetItem(new_name_without_ext)) # 预览时显示新文件名（不含后缀）
+                    self.rename_table.setItem(row, 2, QTableWidgetItem(ext.lstrip("."))) # 显示后缀
                     renamed_count += 1
             else:
                 self.log(f"[智能改名] 未找到匹配的代码，跳过文件: {basename}", "orange")
@@ -27757,54 +26913,23 @@ class FileManagerPro(QMainWindow):
             f"无效名称 {len(invalid)} 个。",
             "green"
         )
-    def renamer_pick_files(self):
-        start_dir = self._get_browse_start_dir()
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "选择要重命名的文件", start_dir, "所有文件 (*)")
-        if not file_paths:
-            return
-        self._last_browse_dir = os.path.dirname(file_paths[0])
-        for fp in file_paths:
-            self.renamer_add_file(fp)
-
-    def renamer_pick_folder(self):
-        start_dir = self._get_browse_start_dir()
-        folder_path = QFileDialog.getExistingDirectory(self, "选择要重命名的文件夹", start_dir)
-        if not folder_path:
-            return
-        self._last_browse_dir = folder_path
-        file_paths = []
-        for root, _, filenames in os.walk(folder_path):
-            for fname in filenames:
-                file_paths.append(os.path.join(root, fname))
-        file_paths.sort(key=lambda x: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', os.path.basename(x))])
-        for fp in file_paths:
-            self.renamer_add_file(fp)
-
     def renamer_add_file(self, fpath):
-        prefix, main, suffix, ext = self._split_renamer_filename(fpath)
-        row = self.rename_table.rowCount()
-        self.rename_table.insertRow(row)
+        row = self.rename_table.rowCount(); self.rename_table.insertRow(row)
         self.rename_table.setItem(row, 0, QTableWidgetItem(fpath))
-        self.rename_table.setItem(row, 1, QTableWidgetItem(prefix))
-        self.rename_table.setItem(row, 2, QTableWidgetItem(main))
-        self.rename_table.setItem(row, 3, QTableWidgetItem(suffix))
-        self.rename_table.setItem(row, 4, QTableWidgetItem(ext))
-
-    def renamer_apply_insert_text(self):
-        text = str(self.renamer_insert_text_input.text() or "").strip()
-        if not text:
-            QMessageBox.warning(self, "提示", "请先输入要添加的字段内容")
-            return
-        target_col = 1 if self.renamer_insert_pos_combo.currentText() == "前缀" else 3
+        self.rename_table.setItem(row, 1, QTableWidgetItem(""))
+        fname = os.path.basename(fpath)
+        if not self.ext_check.isChecked(): fname = os.path.splitext(fname)[0]
+        self.rename_table.setItem(row, 2, QTableWidgetItem(fname))
+    def renamer_toggle_ext(self, checked):
+        if not hasattr(self, "rename_table") or self.rename_table.rowCount() == 0: return
         for i in range(self.rename_table.rowCount()):
-            old = self._renamer_item_text(i, target_col)
-            new = f"{old}-{text}" if old else text
-            self.rename_table.setItem(i, target_col, QTableWidgetItem(new))
-
+            fpath = self.rename_table.item(i, 0).text(); fname = os.path.basename(fpath)
+            if not checked: fname = os.path.splitext(fname)[0]
+            self.rename_table.setItem(i, 2, QTableWidgetItem(fname))
     def renamer_batch_replace(self):
         f = self.find_input.text(); r = self.replace_input.text(); is_re = self.regex_check.isChecked()
         for i in range(self.rename_table.rowCount()):
-            for col in (1, 2, 3):
+            for col in (1, 2):
                 item = self.rename_table.item(i, col)
                 if not item:
                     continue
@@ -27817,64 +26942,68 @@ class FileManagerPro(QMainWindow):
     def renamer_del_front(self):
         n = self.del_front_spin.value()
         for i in range(self.rename_table.rowCount()):
-            old = self._renamer_item_text(i, 2)
-            self.rename_table.setItem(i, 2, QTableWidgetItem(old[n:]))
-
+            old = self.rename_table.item(i, 2).text(); self.rename_table.setItem(i, 2, QTableWidgetItem(old[n:]))
     def renamer_del_back(self):
         n = self.del_back_spin.value()
         for i in range(self.rename_table.rowCount()):
-            old = self._renamer_item_text(i, 2)
-            if n > 0:
-                self.rename_table.setItem(i, 2, QTableWidgetItem(old[:-n]))
-
+            old = self.rename_table.item(i, 2).text()
+            if n > 0: self.rename_table.setItem(i, 2, QTableWidgetItem(old[:-n]))
     def renamer_auto_number(self):
-        target_text = self.renamer_number_target_combo.currentText() if hasattr(self, "renamer_number_target_combo") else "前缀"
-        target_col = 1 if target_text == "前缀" else (2 if target_text == "主文件名" else 3)
         for i in range(self.rename_table.rowCount()):
-            old = self._renamer_item_text(i, target_col)
-            numbered = f"{i+1:02d}"
-            new_text = f"{numbered}_{old}" if old else numbered
-            self.rename_table.setItem(i, target_col, QTableWidgetItem(new_text))
-
+            old = self.rename_table.item(i, 2).text(); self.rename_table.setItem(i, 2, QTableWidgetItem(f"{i+1:02d}_{old}"))
     def renamer_restore_original(self):
+        checked = self.ext_check.isChecked()
         for i in range(self.rename_table.rowCount()):
-            fpath = self._renamer_item_text(i, 0)
-            prefix, main, suffix, ext = self._split_renamer_filename(fpath)
-            self.rename_table.setItem(i, 1, QTableWidgetItem(prefix))
-            self.rename_table.setItem(i, 2, QTableWidgetItem(main))
-            self.rename_table.setItem(i, 3, QTableWidgetItem(suffix))
-            self.rename_table.setItem(i, 4, QTableWidgetItem(ext))
-
-    def renamer_clear(self):
-        self.rename_table.setRowCount(0)
-        self.is_smart_rename_mode = False
-
+            fpath = self.rename_table.item(i, 0).text(); fname = os.path.basename(fpath)
+            if not checked: fname = os.path.splitext(fname)[0]
+            self.rename_table.setItem(i, 1, QTableWidgetItem("")); self.rename_table.setItem(i, 2, QTableWidgetItem(fname))
+    def renamer_clear(self): self.rename_table.setRowCount(0)
     # detach_chat_panel / restore_chat_panel 已移除（浮动模式已删除）
 
     def renamer_execute(self):
         count = 0
         history = []
+        is_smart_mode = getattr(self, "is_smart_rename_mode", False)
         
         for i in range(self.rename_table.rowCount()):
             item_path = self.rename_table.item(i, 0)
+            item_col1 = self.rename_table.item(i, 1) # 智能模式下是新名(无后缀)，普通模式下是前缀
+            item_col2 = self.rename_table.item(i, 2) # 智能模式下是后缀，普通模式下是主文件名
             
             if not item_path: continue
             old_p = item_path.text().strip()
             if not old_p or not os.path.exists(old_p): continue
             
-            prefix_text = self._renamer_item_text(i, 1)
-            main_text = self._renamer_item_text(i, 2)
-            suffix_text = self._renamer_item_text(i, 3)
-            ext_text = self._renamer_item_text(i, 4)
+            val1 = item_col1.text().strip() if item_col1 else ""
+            val2 = item_col2.text().strip() if item_col2 else ""
             
             dname = os.path.dirname(old_p)
             original_ext = os.path.splitext(old_p)[1]
-            merged_stem = self._compose_renamer_full_stem(prefix_text, main_text, suffix_text).strip()
-            if not merged_stem:
-                continue
-            new_base = self.sanitize_filename(merged_stem)
-            new_ext = self._normalize_renamer_ext(ext_text, original_ext)
-            new_name = f"{new_base}{new_ext}"
+            
+            # 自动判定模式：如果 val2 看起来像后缀(mp4, jpg等)且没有勾选"包含后缀名"，或者显式标记了智能模式
+            # 但最稳妥的是直接根据 val1 和 val2 是否能组合出有效名字
+            
+            if is_smart_mode:
+                # 智能改名模式：val1 是新名，val2 是后缀
+                new_base = self.sanitize_filename(val1)
+                new_ext = val2
+                if new_ext and not new_ext.startswith("."):
+                    new_ext = "." + new_ext
+                # 如果 val2 为空，尝试保留原后缀
+                if not new_ext:
+                    new_ext = original_ext
+                new_name = new_base + new_ext
+            else:
+                # 传统改名模式
+                if not self.ext_check.isChecked():
+                    # val1=前缀, val2=主文件名
+                    new_name = self._compose_renamer_stem(val1, val2) + original_ext
+                else:
+                    # 勾选了包含后缀名：仅当检测到明确、有效的新扩展名时才允许覆盖原后缀
+                    merged_name = self._compose_renamer_stem(val1, val2).strip()
+                    base_name, final_ext = self._resolve_renamer_name_ext(merged_name, original_ext)
+                    fallback_base = self._compose_renamer_stem(val1, val2)
+                    new_name = f"{base_name}{final_ext}" if base_name else f"{fallback_base}{original_ext}"
 
             # 清理非法字符
             new_name = re.sub(r'[\\/:*?"<>|：]', '_', new_name).strip()
@@ -28393,8 +27522,7 @@ class FileManagerPro(QMainWindow):
                 "ai_config": ai_cfg,
                 "review_ai_config": review_ai_cfg,
                 "review_issue_library": review_issue_library,
-                "review_image_rules": review_image_rules,
-                "runtime_installs": _load_runtime_install_state()
+                "review_image_rules": review_image_rules
             }
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=4)
