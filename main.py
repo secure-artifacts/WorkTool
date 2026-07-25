@@ -16493,7 +16493,9 @@ class VideoConcatTab(QWidget):
             if ext_lower in self.VIDEO_EXTS:
                 video_stems.add(stem.lower())
             elif ext_lower == ".txt":
-                txt_stems.add(stem.lower())
+                stem_text = stem.strip()
+                if re.fullmatch(r"\d+", stem_text):
+                    txt_stems.add(stem_text.lower())
         missing = [stem for stem in txt_stems if stem not in video_stems]
         return sorted(missing, key=self._natural_sort_key)
 
