@@ -25363,6 +25363,12 @@ class FileManagerPro(QMainWindow):
         btn_del_b = QPushButton("执行")
         btn_del_b.clicked.connect(self.renamer_del_back)
         num_layout.addWidget(btn_del_b)
+        num_layout.addSpacing(10)
+        num_layout.addWidget(QLabel("自动编号到:"))
+        self.renamer_number_target_combo = QComboBox()
+        self.renamer_number_target_combo.addItems(["前缀", "主文件名", "后缀"])
+        self.renamer_number_target_combo.setCurrentText("前缀")
+        num_layout.addWidget(self.renamer_number_target_combo)
         num_layout.addStretch()
         btn_num = QPushButton("🔢 自动编号")
         btn_num.clicked.connect(self.renamer_auto_number)
@@ -25394,9 +25400,14 @@ class FileManagerPro(QMainWindow):
         self.rename_table.setObjectName("rename_table")
         self.rename_table.setHorizontalHeaderLabels(["原始路径", "前缀", "主文件名", "后缀", "扩展名"])
         self.rename_table.horizontalHeader().setStretchLastSection(False)
-        self.rename_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch if PYQT_VERSION == 6 else QHeaderView.Stretch)
-        for col in (1, 2, 3, 4):
-            self.rename_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents if PYQT_VERSION == 6 else QHeaderView.ResizeToContents)
+        _interactive = QHeaderView.ResizeMode.Interactive if PYQT_VERSION == 6 else QHeaderView.Interactive
+        for col in range(5):
+            self.rename_table.horizontalHeader().setSectionResizeMode(col, _interactive)
+        self.rename_table.setColumnWidth(0, 520)
+        self.rename_table.setColumnWidth(1, 120)
+        self.rename_table.setColumnWidth(2, 220)
+        self.rename_table.setColumnWidth(3, 120)
+        self.rename_table.setColumnWidth(4, 90)
         layout.addWidget(self.rename_table)
         btn_exec_layout = QHBoxLayout()
         btn_exec_layout.addWidget(QLabel("说明：前缀/主文件名/后缀会自动拼成新文件名，扩展名单独控制。"))
@@ -27304,9 +27315,13 @@ class FileManagerPro(QMainWindow):
                 self.rename_table.setItem(i, 2, QTableWidgetItem(old[:-n]))
 
     def renamer_auto_number(self):
+        target_text = self.renamer_number_target_combo.currentText() if hasattr(self, "renamer_number_target_combo") else "前缀"
+        target_col = 1 if target_text == "前缀" else (2 if target_text == "主文件名" else 3)
         for i in range(self.rename_table.rowCount()):
-            old = self._renamer_item_text(i, 2)
-            self.rename_table.setItem(i, 2, QTableWidgetItem(f"{i+1:02d}_{old}"))
+            old = self._renamer_item_text(i, target_col)
+            numbered = f"{i+1:02d}"
+            new_text = f"{numbered}_{old}" if old else numbered
+            self.rename_table.setItem(i, target_col, QTableWidgetItem(new_text))
 
     def renamer_restore_original(self):
         for i in range(self.rename_table.rowCount()):
