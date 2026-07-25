@@ -3682,9 +3682,8 @@ def should_skip_universal_rename(score_value, result_kind="general"):
         if score < threshold:
             return True, f"文案匹配得分过低({score:.1f} < {threshold:.1f})"
         return False, ""
-    threshold = 620.0
-    if score < threshold:
-        return True, f"多模态匹配得分过低({score:.1f} < {threshold:.1f})"
+    # 普通全能对位结果在前面的匹配线程里已经做过可靠性过滤，
+    # 这里不再用统一分值硬拦一次，避免 CLIP 失效时备用分数体系被误伤。
     return False, ""
 
 def format_srt_timestamp(seconds):
