@@ -3772,8 +3772,18 @@ def build_copy_items_from_sources(path_input="", manual_text=""):
             return
         sig = normalize_spoken_text(content)
         if not sig or sig in seen_signatures:
-            return
-        seen_signatures.add(sig)
+            if source_path:
+                source_sig = f"{os.path.abspath(str(source_path))}::{sig}"
+                if source_sig in seen_signatures:
+                    return
+                seen_signatures.add(source_sig)
+            else:
+                return
+        else:
+            if source_path:
+                seen_signatures.add(f"{os.path.abspath(str(source_path))}::{sig}")
+            else:
+                seen_signatures.add(sig)
         items.append({
             "index": len(items),
             "name": clean_long_filename(name or build_copy_match_name(content, len(items) + 1), max_len=80),
@@ -9045,13 +9055,153 @@ class VideoCopyMatchThread(QThread):
     AUDIO_EXTS = UniversalMatchThread.AUDIO_EXTS
     MEDIA_EXTS = VIDEO_EXTS + AUDIO_EXTS
 
-    def __init__(self, video_input, copy_items, clip_model_name="OFA-Sys/chinese-clip-vit-large-patch14", clip_use_gpu=True, ai_config=None):
+    def __init__(self, video_input, copy_items, clip_model_name="OFA-Sys/chinese-clip-vit-large-patch14", clip_use_gpu=True, ai_config=None, text_input=""):
         super().__init__()
         self.video_input = video_input
         self.copy_items = list(copy_items or [])
         self.clip_model_name = clip_model_name
         self.clip_use_gpu = clip_use_gpu
         self.ai_config = dict(ai_config or {})
+        self.text_input = str(text_input or "")
+
+    def _split_input_paths(self, path_input):
+        seen = set()
+        result = []
+        for raw in str(path_input or "").split('\n'):
+            p = str(raw or "").strip().strip('"').strip()
+            if not p or not os.path.exists(p):
+                continue
+            abs_p = os.path.abspath(p)
+            if abs_p in seen:
+                continue
+            seen.add(abs_p)
+            result.append(abs_p)
+        return result
+
+    def _belongs_to_root(self, path, root):
+        try:
+            return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+        except Exception:
+            return False
+
+    def _infer_item_group_root(self, source_path, candidate_roots):
+        src = os.path.abspath(str(source_path or ""))
+        if not src:
+            return ""
+        roots = sorted([os.path.abspath(r) for r in (candidate_roots or [])], key=len, reverse=True)
+        for root in roots:
+            if self._belongs_to_root(src, root):
+                return root
+        return os.path.dirname(src)
+
+    def _build_media_groups(self):
+        groups = []
+        for path in self._split_input_paths(self.video_input):
+            if os.path.isfile(path):
+                if path.lower().endswith(self.MEDIA_EXTS):
+                    groups.append({
+                        "root": path,
+                        "label": os.path.basename(path),
+                        "media_files": [path],
+                    })
+                continue
+            media_files = self._collect_media_files(path)
+            if media_files:
+                groups.append({
+                    "root": path,
+                    "label": os.path.basename(path.rstrip(os.sep)) or path,
+                    "media_files": media_files,
+                })
+        return groups
+
+    def _build_text_groups(self, copy_items):
+        text_roots = self._split_input_paths(self.text_input)
+        grouped = {}
+        shared_items = []
+        for item in copy_items:
+            src_path = str(item.get("source_path", "") or "").strip()
+            if not src_path:
+                shared_items.append(item)
+                continue
+            owner_root = self._infer_item_group_root(src_path, text_roots)
+            grouped.setdefault(owner_root, []).append(item)
+        return text_roots, grouped, shared_items
+
+    def _pick_text_root_for_media_group(self, media_group, media_index, media_groups, text_roots):
+        media_root = os.path.abspath(str(media_group.get("root", "") or ""))
+        if not text_roots:
+            return ""
+        if len(text_roots) == 1:
+            return text_roots[0]
+        if media_root in text_roots:
+            return media_root
+        media_name = os.path.basename(media_root.rstrip(os.sep)).lower()
+        basename_matches = [root for root in text_roots if os.path.basename(root.rstrip(os.sep)).lower() == media_name]
+        if len(basename_matches) == 1:
+            return basename_matches[0]
+        if len(text_roots) == len(media_groups) and 0 <= media_index < len(text_roots):
+            return text_roots[media_index]
+        return ""
+
+    def _prepare_text_meta(self, copy_items):
+        text_meta = []
+        for idx, item in enumerate(copy_items):
+            try:
+                text = str(item.get("content", "")).strip()
+                text_meta.append({
+                    "name": clean_long_filename(item.get("name") or build_copy_match_name(text, idx + 1), max_len=80),
+                    "content": text,
+                })
+            except Exception as e:
+                self.log.emit(f"⚠️ 文案处理失败，已跳过第 {idx + 1} 段：{e}", "orange")
+        return text_meta
+
+    def _match_videos_against_texts(self, video_meta, text_meta, group_label=""):
+        results = []
+        label_prefix = f"[{group_label}] " if group_label else ""
+        for video in video_meta:
+            best_name = ""
+            best_text = ""
+            best_transcript = ""
+            best_sim = -1e9
+            second_best = -1e9
+            for txt in text_meta:
+                sim = score_transcript_against_copy(video["transcript"], txt["content"])
+                if sim > best_sim:
+                    second_best = best_sim
+                    best_sim = sim
+                    best_name = txt["name"]
+                    best_text = txt["content"]
+                    best_transcript = video["transcript"]
+                elif sim > second_best:
+                    second_best = sim
+            ok_match, threshold, reject_reason = is_copy_match_acceptable(
+                best_sim,
+                video["transcript"],
+                best_text,
+                second_best=second_best if second_best > -1e8 else None
+            )
+            final_score = round(best_sim * 100, 1)
+            if ok_match:
+                results.append({
+                    "src_label": best_name,
+                    "rename_name": best_name,
+                    "res": video["path"],
+                    "score": final_score,
+                    "srt_path": "",
+                    "tooltip": f"文件夹：{group_label or '未分组'}\n文案：{best_text}\n\n转写：{best_transcript[:500]}",
+                    "match_ok": True,
+                })
+                self.log.emit(
+                    f"{label_prefix}✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
+                    "green"
+                )
+            else:
+                self.log.emit(
+                    f"{label_prefix}⚠️ 跳过 {os.path.basename(video['path'])}：{reject_reason}，不自动改名",
+                    "orange"
+                )
+        return results
 
     def _collect_media_files(self, path_input):
         files = []
@@ -9344,118 +9494,100 @@ class VideoCopyMatchThread(QThread):
 
     def run(self):
         try:
-            video_paths = self._collect_media_files(self.video_input)
             copy_items = [item for item in self.copy_items if str(item.get("content", "")).strip()]
-            if not video_paths:
+            media_groups = self._build_media_groups()
+            if not media_groups:
                 self.error.emit("未找到可匹配的音频/视频文件")
                 return
             if not copy_items:
                 self.error.emit("没有可用文案，请至少填写 1 段文案")
                 return
 
+            text_roots, grouped_text_items, shared_text_items = self._build_text_groups(copy_items)
+            total_media = sum(len(g.get("media_files") or []) for g in media_groups)
+
             self.log.emit(
-                f"[音频文案匹配] 🎬 开始：{len(video_paths)} 个音频/视频 × {len(copy_items)} 段文案",
+                f"[音频文案匹配] 🎬 开始：{len(media_groups)} 个文件夹/分组，{total_media} 个音频/视频，共 {len(copy_items)} 段文案",
                 "blue"
             )
 
-            video_meta = []
-            total = len(video_paths)
-            for idx, path in enumerate(video_paths):
-                temp_audio = self._extract_audio_wav(path)
-                if not temp_audio:
-                    self.log.emit(f"⚠️ 跳过：无法提取音轨 {os.path.basename(path)}", "orange")
-                    self.progress.emit(int((idx + 1) / max(1, total) * 60))
-                    continue
-                try:
-                    transcribed = self._transcribe_audio(temp_audio)
-                    transcript = str(transcribed.get("text", "") or "").strip()
-                    engine_used = str(transcribed.get("engine", "") or "").strip()
-                    video_meta.append({
-                        "path": path,
-                        "name": os.path.basename(path),
-                        "transcript": transcript,
-                        "engine": engine_used,
-                        "segments": transcribed.get("segments") or [],
-                    })
-                    self.log.emit(
-                        f"📝 已转写 {os.path.basename(path)} ({engine_used})：{smart_wrap_text(transcript[:80])}",
-                        "gray"
-                    )
-                except Exception as e:
-                    self.log.emit(f"⚠️ 跳过：{os.path.basename(path)} 转写失败：{e}", "orange")
-                finally:
-                    try:
-                        if os.path.exists(temp_audio):
-                            os.remove(temp_audio)
-                    except Exception:
-                        pass
-                self.progress.emit(int((idx + 1) / max(1, total) * 60))
-
-            if not video_meta:
-                self.error.emit("所有视频都无法完成音频转写，无法进行文案匹配")
-                return
-
-            text_meta = []
-            for idx, item in enumerate(copy_items):
-                try:
-                    text = str(item.get("content", "")).strip()
-                    text_meta.append({
-                        "name": clean_long_filename(item.get("name") or build_copy_match_name(text, idx + 1), max_len=80),
-                        "content": text,
-                    })
-                except Exception as e:
-                    self.log.emit(f"⚠️ 文案处理失败，已跳过第 {idx + 1} 段：{e}", "orange")
-                self.progress.emit(60 + int((idx + 1) / max(1, len(copy_items)) * 10))
-
-            if not text_meta:
-                self.error.emit("文案处理失败，无法进行匹配")
-                return
-
             results = []
-            self.log.emit("[音频文案匹配] 当前采用逐视频匹配：同一文本名允许命中多个视频；重名会在改名时自动追加 _2、_3。", "gray")
-            for idx, video in enumerate(video_meta):
-                best_name = ""
-                best_text = ""
-                best_transcript = ""
-                best_sim = -1e9
-                second_best = -1e9
-                for txt in text_meta:
-                    sim = score_transcript_against_copy(video["transcript"], txt["content"])
-                    if sim > best_sim:
-                        second_best = best_sim
-                        best_sim = sim
-                        best_name = txt["name"]
-                        best_text = txt["content"]
-                        best_transcript = video["transcript"]
-                    elif sim > second_best:
-                        second_best = sim
-                ok_match, threshold, reject_reason = is_copy_match_acceptable(
-                    best_sim,
-                    video["transcript"],
-                    best_text,
-                    second_best=second_best if second_best > -1e8 else None
-                )
-                final_score = round(best_sim * 100, 1)
-                if ok_match:
-                    results.append({
-                        "src_label": best_name,
-                        "rename_name": best_name,
-                        "res": video["path"],
-                        "score": final_score,
-                        "srt_path": "",
-                        "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
-                        "match_ok": True,
-                    })
-                    self.log.emit(
-                        f"✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
-                        "green"
-                    )
-                else:
-                    self.log.emit(
-                        f"⚠️ 跳过 {os.path.basename(video['path'])}：{reject_reason}，不自动改名",
-                        "orange"
-                    )
-                self.progress.emit(70 + int((idx + 1) / max(1, len(video_meta)) * 30))
+            processed_media = 0
+            self.log.emit("[音频文案匹配] 当前采用按文件夹分别匹配：每个文件夹内部独立做“视频对文本”；同一文本名允许命中多个视频，重名自动追加 _2、_3。", "gray")
+            for group_index, media_group in enumerate(media_groups):
+                group_label = str(media_group.get("label", "") or f"分组{group_index + 1}")
+                media_files = list(media_group.get("media_files") or [])
+                group_root = str(media_group.get("root", "") or "")
+                text_root = self._pick_text_root_for_media_group(media_group, group_index, media_groups, text_roots)
+                group_copy_items = list(shared_text_items)
+                if text_root and text_root in grouped_text_items:
+                    group_copy_items.extend(grouped_text_items.get(text_root) or [])
+                elif group_root in grouped_text_items:
+                    group_copy_items.extend(grouped_text_items.get(group_root) or [])
+                if not group_copy_items and len(media_groups) == 1:
+                    group_copy_items = list(copy_items)
+
+                if not group_copy_items:
+                    self.log.emit(f"[{group_label}] ⚠️ 跳过：当前文件夹没有找到可用文本", "orange")
+                    processed_media += len(media_files)
+                    self.progress.emit(int(processed_media / max(1, total_media) * 60))
+                    continue
+
+                text_meta = self._prepare_text_meta(group_copy_items)
+                if not text_meta:
+                    self.log.emit(f"[{group_label}] ⚠️ 跳过：当前文件夹文本解析失败", "orange")
+                    processed_media += len(media_files)
+                    self.progress.emit(int(processed_media / max(1, total_media) * 60))
+                    continue
+
+                mapped_text_root = text_root or group_root
+                root_hint = f"；文本来源：{os.path.basename(str(mapped_text_root).rstrip(os.sep)) or mapped_text_root}" if mapped_text_root else ""
+                self.log.emit(f"[{group_label}] 开始匹配：{len(media_files)} 个音频/视频 × {len(text_meta)} 段文案{root_hint}", "blue")
+
+                video_meta = []
+                for path in media_files:
+                    temp_audio = self._extract_audio_wav(path)
+                    if not temp_audio:
+                        self.log.emit(f"[{group_label}] ⚠️ 跳过：无法提取音轨 {os.path.basename(path)}", "orange")
+                        processed_media += 1
+                        self.progress.emit(int(processed_media / max(1, total_media) * 60))
+                        continue
+                    try:
+                        transcribed = self._transcribe_audio(temp_audio)
+                        transcript = str(transcribed.get("text", "") or "").strip()
+                        engine_used = str(transcribed.get("engine", "") or "").strip()
+                        video_meta.append({
+                            "path": path,
+                            "name": os.path.basename(path),
+                            "transcript": transcript,
+                            "engine": engine_used,
+                            "segments": transcribed.get("segments") or [],
+                        })
+                        self.log.emit(
+                            f"[{group_label}] 📝 已转写 {os.path.basename(path)} ({engine_used})：{smart_wrap_text(transcript[:80])}",
+                            "gray"
+                        )
+                    except Exception as e:
+                        self.log.emit(f"[{group_label}] ⚠️ 跳过：{os.path.basename(path)} 转写失败：{e}", "orange")
+                    finally:
+                        try:
+                            if os.path.exists(temp_audio):
+                                os.remove(temp_audio)
+                        except Exception:
+                            pass
+                    processed_media += 1
+                    self.progress.emit(int(processed_media / max(1, total_media) * 60))
+
+                if not video_meta:
+                    self.log.emit(f"[{group_label}] ⚠️ 跳过：当前文件夹所有视频都无法完成音频转写", "orange")
+                    continue
+
+                results.extend(self._match_videos_against_texts(video_meta, text_meta, group_label=group_label))
+                self.progress.emit(60 + int((group_index + 1) / max(1, len(media_groups)) * 40))
+
+            if not results:
+                self.error.emit("所有文件夹都没有生成有效匹配结果，请检查每个文件夹内是否同时存在可转写的视频和可匹配的文本")
+                return
 
             results.sort(key=lambda x: str(x.get("res", "")).lower())
             self.progress.emit(100)
@@ -21896,7 +22028,8 @@ class FileManagerPro(QMainWindow):
             copy_items,
             clip_model_name=clip_model_name,
             clip_use_gpu=clip_use_gpu,
-            ai_config=ai_cfg
+            ai_config=ai_cfg,
+            text_input=text_source
         )
         self.uni_copy_match_thread.progress.connect(self.uni_progress_bar.setValue)
         self.uni_copy_match_thread.log.connect(self.log)
