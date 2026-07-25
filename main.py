@@ -110,6 +110,225 @@ SORTER_AUTO_DIR_MARKER = ".ai_sorter_auto_dir"
 
 _API_THROTTLE_LOCK = Lock()
 _API_NEXT_ALLOWED_TS = {}
+_RUNTIME_INSTALL_STATE_LOCK = Lock()
+
+
+def _load_config_dict_safely():
+    try:
+        if not os.path.exists(CONFIG_FILE):
+            return {}
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_config_dict_safely(cfg):
+    data = cfg if isinstance(cfg, dict) else {}
+    try:
+        tmp_path = CONFIG_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        os.replace(tmp_path, CONFIG_FILE)
+        return True
+    except Exception:
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            return True
+        except Exception:
+            return False
+
+
+def _normalize_runtime_install_records(records):
+    if not isinstance(records, dict):
+        return {}
+    normalized = {}
+    for key, item in records.items():
+        if isinstance(item, dict):
+            normalized[str(key)] = dict(item)
+    return normalized
+
+
+def _load_runtime_install_state():
+    cfg = _load_config_dict_safely()
+    return _normalize_runtime_install_records(cfg.get("runtime_installs", {}))
+
+
+def _get_runtime_install_record(state_key):
+    records = _load_runtime_install_state()
+    return dict(records.get(str(state_key or "").strip(), {}) or {})
+
+
+def _update_runtime_install_record(state_key, installed=None, version=None, error=None, package_names=None, python_exe=None, extra=None):
+    key = str(state_key or "").strip()
+    if not key:
+        return {}
+    with _RUNTIME_INSTALL_STATE_LOCK:
+        cfg = _load_config_dict_safely()
+        records = _normalize_runtime_install_records(cfg.get("runtime_installs", {}))
+        entry = dict(records.get(key, {}) or {})
+        if installed is not None:
+            entry["installed"] = bool(installed)
+        if version is not None:
+            entry["version"] = str(version or "")
+        if error is not None:
+            entry["error"] = str(error or "")
+        if package_names is not None:
+            entry["packages"] = [str(x or "").strip() for x in package_names if str(x or "").strip()]
+        if python_exe is None:
+            py_exe = sys.executable or ""
+            try:
+                if "_resolve_preferred_python_exe" in globals():
+                    py_exe, manual_exe = _resolve_preferred_python_exe()
+                    python_exe = manual_exe or py_exe or sys.executable or ""
+                else:
+                    python_exe = py_exe
+            except Exception:
+                python_exe = py_exe
+        entry["python_exe"] = str(python_exe or "")
+        entry["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                entry[str(k)] = v
+        records[key] = entry
+        cfg["runtime_installs"] = records
+        _save_config_dict_safely(cfg)
+        return entry
+
+
+def _get_module_version_safe(module_name):
+    name = str(module_name or "").strip()
+    if not name:
+        return ""
+    try:
+        mod = importlib.import_module(name)
+    except Exception:
+        return ""
+    for attr in ("__version__", "version"):
+        value = getattr(mod, attr, "")
+        if value:
+            return str(value)
+    return ""
+
+
+def _can_import_modules(module_names):
+    names = [str(x or "").strip() for x in (module_names or []) if str(x or "").strip()]
+    if not names:
+        return False
+    try:
+        for name in names:
+            importlib.import_module(name)
+        return True
+    except Exception:
+        return False
+
+
+def _has_trusted_runtime_install(state_key):
+    entry = _get_runtime_install_record(state_key)
+    if not entry or not entry.get("installed", False):
+        return False, entry
+    try:
+        py_exe = sys.executable or ""
+        if "_resolve_preferred_python_exe" in globals():
+            py_exe, manual_exe = _resolve_preferred_python_exe()
+            py_exe = manual_exe or py_exe or sys.executable or ""
+        current_exe = os.path.normcase(os.path.abspath(str(py_exe or "")))
+        saved_exe = os.path.normcase(os.path.abspath(str(entry.get("python_exe", "") or "")))
+        if saved_exe and current_exe and saved_exe != current_exe:
+            return False, entry
+    except Exception:
+        pass
+    return True, entry
+
+
+def _mark_runtime_install_success(state_key, module_name=None, package_names=None, extra=None):
+    version = _get_module_version_safe(module_name) if module_name else ""
+    return _update_runtime_install_record(
+        state_key,
+        installed=True,
+        version=version,
+        error="",
+        package_names=package_names,
+        extra=extra,
+    )
+
+
+def _mark_runtime_install_failed(state_key, error="", package_names=None, extra=None):
+    return _update_runtime_install_record(
+        state_key,
+        installed=False,
+        error=str(error or ""),
+        package_names=package_names,
+        extra=extra,
+    )
+
+
+def _ensure_runtime_packages_cached(pip_libs, validator, module_prefixes, log_fn=None, label="运行时依赖", timeout=600, force_reinstall=False, extra_pip_args=None, state_key=None, import_probe_modules=None):
+    runtime_key = str(state_key or (pip_libs[0] if pip_libs else label)).strip() or label
+    probe_modules = [str(x or "").strip() for x in (import_probe_modules or pip_libs or []) if str(x or "").strip()]
+
+    if probe_modules and _can_import_modules(probe_modules):
+        _mark_runtime_install_success(runtime_key, module_name=probe_modules[0], package_names=pip_libs, extra={"last_label": label})
+        if callable(log_fn):
+            log_fn(f"ℹ️ {label} 已可直接导入，跳过自动安装", "gray")
+        return True, {"cached": True, "source": "import_probe"}
+
+    trusted, _ = _has_trusted_runtime_install(runtime_key)
+    if trusted:
+        if callable(log_fn):
+            log_fn(f"ℹ️ {label} 命中历史安装记录，当前导入失败，准备自动修复一次", "gray")
+        _mark_runtime_install_failed(runtime_key, error="命中历史安装记录但导入失败，已转入自动修复", package_names=pip_libs, extra={"last_label": label})
+
+    ok, info = _ensure_runtime_packages(
+        pip_libs,
+        validator,
+        module_prefixes,
+        log_fn=log_fn,
+        label=label,
+        timeout=timeout,
+        force_reinstall=force_reinstall,
+        extra_pip_args=extra_pip_args,
+    )
+    if ok:
+        _mark_runtime_install_success(runtime_key, module_name=probe_modules[0] if probe_modules else None, package_names=pip_libs, extra={"last_label": label})
+    else:
+        detail = str((info or {}).get("error", "") or "未知错误").strip()
+        _mark_runtime_install_failed(runtime_key, error=detail, package_names=pip_libs, extra={"last_label": label})
+    return ok, info
+
+
+def _silent_install_libs_once(pip_libs, timeout=120, log_prefix="[ENV]", force_reinstall=False, extra_pip_args=None, state_key=None, import_probe_modules=None):
+    targets = [str(lib or "").strip() for lib in (pip_libs or []) if str(lib or "").strip()]
+    if not targets:
+        return True, {"noop": True}
+    runtime_key = str(state_key or targets[0]).strip() or targets[0]
+    probe_modules = [str(x or "").strip() for x in (import_probe_modules or targets) if str(x or "").strip()]
+
+    if probe_modules and _can_import_modules(probe_modules):
+        entry = _mark_runtime_install_success(runtime_key, module_name=probe_modules[0], package_names=targets, extra={"last_label": log_prefix})
+        return True, {"cached": True, "source": "import_probe", "entry": entry}
+
+    trusted, _ = _has_trusted_runtime_install(runtime_key)
+    if trusted:
+        _mark_runtime_install_failed(runtime_key, error="命中历史安装记录但导入失败，已转入自动重装", package_names=targets, extra={"last_label": log_prefix})
+
+    ok = _silent_install_libs(
+        targets,
+        timeout=timeout,
+        log_prefix=log_prefix,
+        force_reinstall=force_reinstall,
+        extra_pip_args=extra_pip_args,
+    )
+    if ok and (not probe_modules or _can_import_modules(probe_modules)):
+        entry = _mark_runtime_install_success(runtime_key, module_name=probe_modules[0] if probe_modules else None, package_names=targets, extra={"last_label": log_prefix})
+        return True, {"installed": True, "entry": entry}
+
+    err_msg = "自动安装完成但模块仍无法导入" if ok else "自动安装失败"
+    entry = _mark_runtime_install_failed(runtime_key, error=err_msg, package_names=targets, extra={"last_label": log_prefix})
+    return False, {"error": err_msg, "entry": entry}
+
 
 def normalize_api_base(api_base, default=""):
     return (api_base or default or "").strip().rstrip("/")
@@ -3377,6 +3596,97 @@ def score_transcript_against_copy(transcript, copy_text):
     contains_bonus = 0.12 if (len(a) >= 8 and a in b) or (len(b) >= 8 and b in a) else 0.0
     return max(0.0, min(1.0, ratio * 0.45 + lcs_ratio * 0.35 + gram_ratio * 0.20 + contains_bonus))
 
+
+def get_copy_match_accept_threshold(transcript, copy_text):
+    transcript_norm = normalize_spoken_text(transcript)
+    copy_norm = normalize_spoken_text(copy_text)
+    target_len = len(copy_norm)
+    threshold = 0.36
+    if target_len >= 12:
+        threshold = 0.42
+    if target_len >= 28:
+        threshold = 0.48
+    if target_len >= 60:
+        threshold = 0.54
+    if transcript_norm and copy_norm:
+        len_ratio = min(len(transcript_norm), len(copy_norm)) / max(1, max(len(transcript_norm), len(copy_norm)))
+        if len_ratio < 0.35:
+            threshold += 0.05
+        if len_ratio < 0.20:
+            threshold += 0.06
+    return max(0.30, min(0.72, threshold))
+
+
+def is_copy_match_acceptable(best_score, transcript, copy_text, second_best=None):
+    try:
+        score = float(best_score or 0.0)
+    except Exception:
+        score = 0.0
+    threshold = get_copy_match_accept_threshold(transcript, copy_text)
+    if score < threshold:
+        return False, threshold, f"得分过低({score:.2f} < {threshold:.2f})"
+    if second_best is not None:
+        try:
+            margin = score - float(second_best or 0.0)
+        except Exception:
+            margin = score
+        if margin < 0.035 and score < min(0.78, threshold + 0.10):
+            return False, threshold, f"候选过于接近，结果不够确定(差值 {margin:.3f})"
+    return True, threshold, ""
+
+
+def is_universal_match_reliable(visual_sim=None, audio_sim=None, hash_sim=None):
+    def _norm(v):
+        try:
+            val = float(v)
+        except Exception:
+            return None
+        if val < 0:
+            return None
+        return val
+
+    visual = _norm(visual_sim)
+    audio = _norm(audio_sim)
+    dhash = _norm(hash_sim)
+
+    if visual is not None and audio is not None:
+        avg = (visual + audio) / 2.0
+        if max(visual, audio) >= 0.60 and avg >= 0.52:
+            return True, ""
+        return False, f"视听证据不足(视觉 {visual:.3f} / 音频 {audio:.3f})"
+    if visual is not None:
+        if visual >= 0.62:
+            return True, ""
+        return False, f"视觉相似度过低({visual:.3f})"
+    if audio is not None:
+        if audio >= 0.58:
+            return True, ""
+        return False, f"音频相似度过低({audio:.3f})"
+    if dhash is not None:
+        if dhash >= 0.82:
+            return True, ""
+        return False, f"画面哈希相似度过低({dhash:.3f})"
+    return False, "没有可用的匹配证据"
+
+
+def should_skip_universal_rename(score_value, result_kind="general"):
+    kind = str(result_kind or "general").strip().lower()
+    try:
+        score = float(str(score_value or "").replace("分", "").strip())
+    except Exception:
+        score = None
+    if score is None:
+        return False, ""
+    if kind == "audio_text":
+        threshold = 48.0
+        if score < threshold:
+            return True, f"文案匹配得分过低({score:.1f} < {threshold:.1f})"
+        return False, ""
+    threshold = 620.0
+    if score < threshold:
+        return True, f"多模态匹配得分过低({score:.1f} < {threshold:.1f})"
+    return False, ""
+
 def format_srt_timestamp(seconds):
     try:
         total_ms = max(0, int(round(float(seconds or 0.0) * 1000)))
@@ -5497,14 +5807,16 @@ class ClipFastMatchThread(QThread):
         except Exception:
             pass
 
-        torch_ready, torch_info = _ensure_runtime_packages(
+        torch_ready, torch_info = _ensure_runtime_packages_cached(
             ["torch", "torchvision"],
             _validate_torch_runtime,
             ["torch", "functorch", "torchvision"],
             log_fn=log_fn,
             label="PyTorch 运行时",
             timeout=2400,
-            force_reinstall=True,
+            force_reinstall=False,
+            state_key="torch_runtime",
+            import_probe_modules=["torch", "torchvision"],
         )
         if not torch_ready:
             detail = str((torch_info or {}).get("error", "") or "未知错误").strip()
@@ -5514,14 +5826,16 @@ class ClipFastMatchThread(QThread):
                 "建议：确认网络可用，并使用当前程序自带的 Python 重新安装 torch / torchvision。"
             )
 
-        tf_stack_ready, tf_stack_info = _ensure_runtime_packages(
+        tf_stack_ready, tf_stack_info = _ensure_runtime_packages_cached(
             ["transformers", "safetensors"],
             _validate_transformers_runtime,
             ["transformers", "safetensors"],
             log_fn=log_fn,
             label="Transformers 运行时",
             timeout=1800,
-            force_reinstall=True,
+            force_reinstall=False,
+            state_key="transformers_runtime",
+            import_probe_modules=["transformers", "safetensors"],
         )
         if not tf_stack_ready:
             detail = str((tf_stack_info or {}).get("error", "") or "未知错误").strip()
@@ -8642,13 +8956,20 @@ class UniversalMatchThread(QThread):
                 is_visual_mode = s['is_img']; is_audio_mode = s['is_aud']
                 for r_idx, r in enumerate(res_data):
                     score = 0
+                    visual_sim = None
+                    audio_sim = None
+                    hash_sim = None
                     if not is_audio_mode:
                         if 'clip_feats' in s and 'clip_feats' in r:
                             sims = [np.dot(sf, rf) / (np.linalg.norm(sf) * np.linalg.norm(rf) + 1e-8) for sf in s['clip_feats'] for rf in r['clip_feats']]
-                            if sims: score += np.max(sims) * 1000
+                            if sims:
+                                visual_sim = float(np.max(sims))
+                                score += visual_sim * 1000
                         elif 'v_hashes' in s and 'v_hashes' in r:
                             dists = [sum(c1 != c2 for c1, c2 in zip(sh, rh)) for sh in s['v_hashes'] for rh in r['v_hashes']]
-                            if dists: score += (1.0 - np.min(dists) / 256.0) * 500
+                            if dists:
+                                hash_sim = float(1.0 - np.min(dists) / 256.0)
+                                score += hash_sim * 500
                     if not is_visual_mode:
                         if 'envelope' in s and s['envelope'] is not None and 'envelope' in r and r['envelope'] is not None:
                             env_s = s['envelope']; env_r = r['envelope']
@@ -8656,9 +8977,20 @@ class UniversalMatchThread(QThread):
                             corr = np.correlate(env_r, env_s, mode='valid')
                             if len(corr) > 0:
                                 wave_sim = np.max(corr) / (np.sqrt(np.sum(env_s**2) * np.max([np.sum(env_r[j:j+len(env_s)]**2) for j in range(len(corr))])) + 1e-8)
-                                score += wave_sim * 800
-                    if os.path.splitext(s['name'])[0].lower() == os.path.splitext(r['name'])[0].lower(): score += 0.1
-                    if score > 0: all_pairs.append({'s_idx': s_idx, 'r_idx': r_idx, 'score': score})
+                                audio_sim = float(wave_sim)
+                                score += audio_sim * 800
+                    if os.path.splitext(s['name'])[0].lower() == os.path.splitext(r['name'])[0].lower():
+                        score += 0.1
+                    reliable, reject_reason = is_universal_match_reliable(visual_sim=visual_sim, audio_sim=audio_sim, hash_sim=hash_sim)
+                    if score > 0 and reliable:
+                        all_pairs.append({
+                            's_idx': s_idx,
+                            'r_idx': r_idx,
+                            'score': score,
+                            'visual_sim': visual_sim,
+                            'audio_sim': audio_sim,
+                            'hash_sim': hash_sim,
+                        })
             all_pairs.sort(key=lambda x: x['score'], reverse=True)
             used_s = set(); used_r = set(); matches = []
             reused_image_count = 0
@@ -8681,13 +9013,20 @@ class UniversalMatchThread(QThread):
                     'res': res_data[p['r_idx']]['path'],
                     'score': p['score'],
                     'allow_src_reuse': allow_src_reuse,
+                    'match_ok': True,
+                    'visual_sim': p.get('visual_sim'),
+                    'audio_sim': p.get('audio_sim'),
+                    'hash_sim': p.get('hash_sim'),
                 })
+            unmatched_targets = max(0, len(res_data) - len(matches))
             self.progress.emit(100)
             self.result.emit(matches)
             if reused_image_count > 0:
                 self.log.emit(f"✅ 全局最优对位完成: {len(matches)} 组（其中 {reused_image_count} 组复用了同一图片来源）", "green")
             else:
                 self.log.emit(f"✅ 全局最优对位完成: {len(matches)} 组", "green")
+            if unmatched_targets > 0:
+                self.log.emit(f"[全能对位] 已跳过 {unmatched_targets} 个低置信度目标：未达到可靠匹配阈值，因此不会自动改名。", "orange")
         except Exception as e:
             err_msg = traceback.format_exc()
             self.log.emit(f"❌ UniversalMatchThread 发生严重错误: {e}\n{err_msg}", "red")
@@ -9083,26 +9422,38 @@ class VideoCopyMatchThread(QThread):
                     best_text = ""
                     best_transcript = ""
                     best_sim = -1e9
+                    second_best = -1e9
                     for txt in text_meta:
                         sim = score_transcript_against_copy(video["transcript"], txt["content"])
                         if sim > best_sim:
+                            second_best = best_sim
                             best_sim = sim
                             best_name = txt["name"]
                             best_text = txt["content"]
                             best_transcript = video["transcript"]
+                        elif sim > second_best:
+                            second_best = sim
+                    ok_match, threshold, reject_reason = is_copy_match_acceptable(best_sim, video["transcript"], best_text, second_best=second_best if second_best > -1e8 else None)
                     final_score = round(best_sim * 100, 1)
-                    results.append({
-                        "src_label": best_name,
-                        "rename_name": best_name,
-                        "res": video["path"],
-                        "score": final_score,
-                        "srt_path": "",
-                        "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
-                    })
-                    self.log.emit(
-                        f"✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
-                        "green"
-                    )
+                    if ok_match:
+                        results.append({
+                            "src_label": best_name,
+                            "rename_name": best_name,
+                            "res": video["path"],
+                            "score": final_score,
+                            "srt_path": "",
+                            "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
+                            "match_ok": True,
+                        })
+                        self.log.emit(
+                            f"✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
+                            "green"
+                        )
+                    else:
+                        self.log.emit(
+                            f"⚠️ 跳过 {os.path.basename(video['path'])}：{reject_reason}，不自动改名",
+                            "orange"
+                        )
                     self.progress.emit(70 + int((idx + 1) / max(1, len(video_meta)) * 30))
             else:
                 import numpy as np
@@ -9127,19 +9478,31 @@ class VideoCopyMatchThread(QThread):
                         continue
                     txt = text_meta[i]
                     video = video_meta[j]
-                    final_score = round(float(sims_matrix[i, j]) * 100, 1)
-                    results.append({
-                        "src_label": txt["name"],
-                        "rename_name": txt["name"],
-                        "res": video["path"],
-                        "score": final_score,
-                        "srt_path": "",
-                        "tooltip": f"文案：{txt['content']}\n\n转写：{video['transcript'][:500]}",
-                    })
-                    self.log.emit(
-                        f"✅ {os.path.basename(video['path'])} → {txt['name']} (音频匹配得分: {final_score})",
-                        "green"
-                    )
+                    pair_score = float(sims_matrix[i, j])
+                    row_candidates = [float(x) for idx2, x in enumerate(sims_matrix[i].tolist()) if idx2 != j]
+                    col_candidates = [float(sims_matrix[row_idx, j]) for row_idx in range(M) if row_idx != i]
+                    second_best = max(row_candidates + col_candidates) if (row_candidates or col_candidates) else None
+                    ok_match, threshold, reject_reason = is_copy_match_acceptable(pair_score, video["transcript"], txt["content"], second_best=second_best)
+                    final_score = round(pair_score * 100, 1)
+                    if ok_match:
+                        results.append({
+                            "src_label": txt["name"],
+                            "rename_name": txt["name"],
+                            "res": video["path"],
+                            "score": final_score,
+                            "srt_path": "",
+                            "tooltip": f"文案：{txt['content']}\n\n转写：{video['transcript'][:500]}",
+                            "match_ok": True,
+                        })
+                        self.log.emit(
+                            f"✅ {os.path.basename(video['path'])} → {txt['name']} (音频匹配得分: {final_score})",
+                            "green"
+                        )
+                    else:
+                        self.log.emit(
+                            f"⚠️ 跳过 {os.path.basename(video['path'])}：{reject_reason}，不自动改名",
+                            "orange"
+                        )
                     self.progress.emit(70 + int((i + 1) / max(1, M) * 30))
 
             results.sort(key=lambda x: str(x.get("res", "")).lower())
@@ -10817,17 +11180,28 @@ class VideoConcatBatchThread(QThread):
         try:
             from faster_whisper import WhisperModel
         except Exception as e:
-            self.log.emit("📦 检测到无人声裁剪缺少 faster-whisper，正在首次自动安装...", "blue")
-            ok = _silent_install_libs(["faster_whisper"], timeout=1200, log_prefix="[NO-VOICE]")
+            self.log.emit("📦 检测到无人声裁剪缺少 faster-whisper，正在自动安装（仅首次或损坏后重装）...", "blue")
+            ok, install_info = _silent_install_libs_once(
+                ["faster_whisper"],
+                timeout=1200,
+                log_prefix="[NO-VOICE]",
+                state_key="faster_whisper",
+                import_probe_modules=["faster_whisper"],
+            )
             if not ok:
                 self._concat_voice_model_failed = True
-                self.log.emit(f"⚠️ faster-whisper 自动安装失败，已跳过无人声裁剪：{e}", "orange")
+                detail = str((install_info or {}).get("error", "") or e).strip()
+                self.log.emit(f"⚠️ faster-whisper 自动安装失败，已跳过无人声裁剪：{detail}", "orange")
                 return None
             try:
                 from faster_whisper import WhisperModel
-                self.log.emit("✅ faster-whisper 自动安装完成，继续执行无人声裁剪", "green")
+                if (install_info or {}).get("cached"):
+                    self.log.emit("ℹ️ faster-whisper 已安装，跳过重复安装", "gray")
+                else:
+                    self.log.emit("✅ faster-whisper 自动安装完成，继续执行无人声裁剪", "green")
             except Exception as e2:
                 self._concat_voice_model_failed = True
+                _mark_runtime_install_failed("faster_whisper", error=str(e2), package_names=["faster_whisper"], extra={"last_label": "[NO-VOICE]"})
                 self.log.emit(f"⚠️ faster-whisper 安装后仍不可用，已跳过无人声裁剪：{e2}", "orange")
                 return None
         device_candidates = [("cpu", "int8")]
@@ -21508,12 +21882,23 @@ class FileManagerPro(QMainWindow):
             self.btn_uni_run_srt_only.setText(" 📝 生成字幕文件 ")
 
     def install_faster_whisper_for_match(self):
-        ok = _silent_install_libs(["faster_whisper"], timeout=1200, log_prefix="[ASR]")
+        ok, install_info = _silent_install_libs_once(
+            ["faster_whisper"],
+            timeout=1200,
+            log_prefix="[ASR]",
+            state_key="faster_whisper",
+            import_probe_modules=["faster_whisper"],
+        )
         if ok:
-            QMessageBox.information(self, "安装完成", "faster-whisper 已安装完成，现在可以直接执行音频/视频对白对文本匹配。")
-            self.log("[音频转写] ✅ faster-whisper 安装完成", "green")
+            if (install_info or {}).get("cached"):
+                QMessageBox.information(self, "已就绪", "faster-whisper 之前已经安装过，本次已直接跳过重复安装。")
+                self.log("[音频转写] ℹ️ faster-whisper 已安装，跳过重复安装", "gray")
+            else:
+                QMessageBox.information(self, "安装完成", "faster-whisper 已安装完成，现在可以直接执行音频/视频对白对文本匹配。")
+                self.log("[音频转写] ✅ faster-whisper 安装完成", "green")
         else:
-            QMessageBox.warning(self, "安装失败", "faster-whisper 自动安装失败。请检查网络或权限，或稍后重试。")
+            detail = str((install_info or {}).get("error", "") or "请检查网络或权限，或稍后重试。")
+            QMessageBox.warning(self, "安装失败", f"faster-whisper 自动安装失败。\n\n{detail}")
             self.log("[音频转写] ❌ faster-whisper 自动安装失败", "red")
 
     def run_universal_match(self):
@@ -21642,7 +22027,7 @@ class FileManagerPro(QMainWindow):
         self.uni_txt_export_thread.error.connect(lambda msg: (self.log(msg, "red"), QMessageBox.critical(self, "TXT生成失败", msg)))
         self.uni_txt_export_thread.start()
 
-    def _append_universal_match_row(self, src_label, res_label, score_value, src_abs="", res_abs="", rename_name="", tooltip="", srt_label="", srt_abs="", txt_label="", txt_abs=""):
+    def _append_universal_match_row(self, src_label, res_label, score_value, src_abs="", res_abs="", rename_name="", tooltip="", srt_label="", srt_abs="", txt_label="", txt_abs="", allow_rename=True, skip_reason=""):
         row = self.uni_match_table.rowCount()
         self.uni_match_table.insertRow(row)
         display_name = str(src_label or rename_name or "")
@@ -21656,6 +22041,8 @@ class FileManagerPro(QMainWindow):
         it_src.setData(_UserRole + 1, stored_rename_name)
         it_src.setData(_UserRole + 2, srt_abs or "")
         it_src.setData(_UserRole + 3, txt_abs or "")
+        it_src.setData(_UserRole + 4, bool(allow_rename))
+        it_src.setData(_UserRole + 5, str(skip_reason or ""))
         it_res.setData(_UserRole, res_abs)
         if tooltip:
             try:
@@ -21702,7 +22089,7 @@ class FileManagerPro(QMainWindow):
             res_ext = os.path.splitext(str(m.get('res', '') or res_rel))[1]
             display_name = f"{rename_name}{res_ext}" if rename_name and res_ext else (rename_name or src_rel)
             tooltip = f"来源：{src_rel}\n目标：{res_rel}"
-            self._append_universal_match_row(display_name, res_rel, m.get('score', ''), src_abs=m.get('src', ''), res_abs=m.get('res', ''), rename_name=rename_name, tooltip=tooltip, srt_label="", srt_abs="", txt_label="", txt_abs="")
+            self._append_universal_match_row(display_name, res_rel, m.get('score', ''), src_abs=m.get('src', ''), res_abs=m.get('res', ''), rename_name=rename_name, tooltip=tooltip, srt_label="", srt_abs="", txt_label="", txt_abs="", allow_rename=bool(m.get('match_ok', True)), skip_reason=str(m.get('skip_reason', '') or ''))
 
     def display_video_copy_match_results(self, matches):
         self._last_universal_match_results = list(matches or [])
@@ -21758,7 +22145,9 @@ class FileManagerPro(QMainWindow):
                 srt_label=srt_rel,
                 srt_abs=srt_abs,
                 txt_label=txt_rel,
-                txt_abs=txt_abs
+                txt_abs=txt_abs,
+                allow_rename=bool(m.get('match_ok', True)),
+                skip_reason=str(m.get('skip_reason', '') or '')
             )
 
     def _resolve_universal_match_abs_path(self, item, base_input_text=""):
@@ -21813,6 +22202,15 @@ class FileManagerPro(QMainWindow):
             if not os.path.exists(res_abs):
                 skipped += 1
                 self.log(f"[全能对位] 跳过第 {i+1} 行：找不到目标文件 -> {res_abs}", "orange")
+                continue
+            allow_rename = bool(it_src.data(_UserRole + 4)) if it_src.data(_UserRole + 4) is not None else True
+            skip_reason = str(it_src.data(_UserRole + 5) or "").strip()
+            score_item = self.uni_match_table.item(i, 2)
+            score_text = score_item.text().strip() if score_item else ""
+            auto_skip, auto_skip_reason = should_skip_universal_rename(score_text, getattr(self, '_last_universal_match_result_kind', 'general'))
+            if (not allow_rename) or auto_skip:
+                skipped += 1
+                self.log(f"[全能对位] 第 {i+1} 行已跳过：{skip_reason or auto_skip_reason or '未达到自动重命名阈值'}", "orange")
                 continue
             rename_name = str(it_src.data(_UserRole + 1) or "").strip()
             if not rename_name:
@@ -27901,7 +28299,8 @@ class FileManagerPro(QMainWindow):
                 "ai_config": ai_cfg,
                 "review_ai_config": review_ai_cfg,
                 "review_issue_library": review_issue_library,
-                "review_image_rules": review_image_rules
+                "review_image_rules": review_image_rules,
+                "runtime_installs": _load_runtime_install_state()
             }
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=4)
