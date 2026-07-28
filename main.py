@@ -3308,18 +3308,57 @@ def collect_text_source_files(path_input):
     seen = set()
     return [x for x in files if not (x in seen or seen.add(x))]
 
-def build_copy_items_from_sources(path_input="", manual_text=""):
+def collect_existing_input_roots(path_input):
+    roots = []
+    seen = set()
+    for p in [x.strip() for x in str(path_input or "").split('\n') if x.strip()]:
+        if not os.path.exists(p):
+            continue
+        abs_path = os.path.abspath(p)
+        root = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
+        if root and root not in seen:
+            seen.add(root)
+            roots.append(root)
+    return roots
+
+def compute_relative_group_key(path, roots=None):
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return ""
+    abs_path = os.path.abspath(raw_path)
+    folder = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
+    norm_roots = [os.path.abspath(r) for r in (roots or []) if str(r or "").strip()]
+    best_root = ""
+    for root in norm_roots:
+        try:
+            common = os.path.commonpath([folder, root])
+        except Exception:
+            continue
+        if common == root and len(root) > len(best_root):
+            best_root = root
+    if best_root:
+        try:
+            rel = os.path.relpath(folder, best_root)
+        except Exception:
+            rel = ""
+        return "" if rel in {".", ""} else rel.replace("\\", "/")
+    return folder.replace("\\", "/")
+
+def build_copy_items_from_sources(path_input="", manual_text="", dedup_scope="global"):
     items = []
     seen_signatures = set()
+    source_roots = collect_existing_input_roots(path_input)
 
     def _append_item(name, content, source_path="", source_stem="", explicit_name=False):
         content = str(content or "").strip()
         if not content:
             return
         sig = normalize_spoken_text(content)
-        if not sig or sig in seen_signatures:
+        folder_group = compute_relative_group_key(source_path, source_roots) if source_path else ""
+        sig_key = (folder_group, sig) if str(dedup_scope or "global") == "folder" else sig
+        if not sig or sig_key in seen_signatures:
             return
-        seen_signatures.add(sig)
+        seen_signatures.add(sig_key)
         items.append({
             "index": len(items),
             "name": clean_long_filename(name or build_copy_match_name(content, len(items) + 1), max_len=80),
@@ -3327,6 +3366,7 @@ def build_copy_items_from_sources(path_input="", manual_text=""):
             "source_path": str(source_path or ""),
             "source_stem": str(source_stem or ""),
             "explicit_name": bool(explicit_name),
+            "folder_group": folder_group,
         })
 
     for item in parse_named_copy_blocks(manual_text):
@@ -8471,13 +8511,15 @@ class VideoCopyMatchThread(QThread):
     AUDIO_EXTS = UniversalMatchThread.AUDIO_EXTS
     MEDIA_EXTS = VIDEO_EXTS + AUDIO_EXTS
 
-    def __init__(self, video_input, copy_items, clip_model_name="OFA-Sys/chinese-clip-vit-large-patch14", clip_use_gpu=True, ai_config=None):
+    def __init__(self, video_input, copy_items, clip_model_name="OFA-Sys/chinese-clip-vit-large-patch14", clip_use_gpu=True, ai_config=None, separate_by_subfolder=False):
         super().__init__()
         self.video_input = video_input
         self.copy_items = list(copy_items or [])
         self.clip_model_name = clip_model_name
         self.clip_use_gpu = clip_use_gpu
         self.ai_config = dict(ai_config or {})
+        self.separate_by_subfolder = bool(separate_by_subfolder)
+        self.media_roots = collect_existing_input_roots(video_input)
 
     def _collect_media_files(self, path_input):
         files = []
@@ -8556,8 +8598,10 @@ class VideoCopyMatchThread(QThread):
         return duplicate_groups, duplicate_videos
 
     def _finalize_match_result_names(self, results):
-        used_names = set()
+        used_names_by_folder = {}
         for item in results or []:
+            folder_key = os.path.dirname(os.path.abspath(str(item.get("res", "") or ""))).lower()
+            used_names = used_names_by_folder.setdefault(folder_key, set())
             base_name = clean_long_filename(
                 str(item.get("rename_name", "") or item.get("src_label", "") or "").strip(),
                 max_len=80
@@ -8584,6 +8628,88 @@ class VideoCopyMatchThread(QThread):
             tooltip = str(item.get("tooltip", "") or "").strip()
             if duplicate_note and duplicate_note not in tooltip:
                 item["tooltip"] = f"{duplicate_note}\n\n{tooltip}" if tooltip else duplicate_note
+        return results
+
+    def _match_group(self, video_meta, text_meta, group_label=""):
+        video_meta = list(video_meta or [])
+        text_meta = list(text_meta or [])
+        if not video_meta or not text_meta:
+            return []
+        results = []
+        group_prefix = f"[{group_label}] " if group_label else ""
+        many_to_one_mode = len(video_meta) > len(text_meta)
+        if many_to_one_mode:
+            self.log.emit(f"[音频文案匹配] {group_prefix}当前视频数量多于文案数量，将允许多个视频命中同一名称。", "gray")
+            for video in video_meta:
+                best_name = ""
+                best_text = ""
+                best_transcript = ""
+                best_sim = -1e9
+                for txt in text_meta:
+                    sim = score_transcript_against_copy(video["transcript"], txt["content"])
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_name = txt["name"]
+                        best_text = txt["content"]
+                        best_transcript = video["transcript"]
+                final_score = round(best_sim * 100, 1)
+                results.append({
+                    "src_label": best_name,
+                    "rename_name": best_name,
+                    "res": video["path"],
+                    "score": final_score,
+                    "srt_path": "",
+                    "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
+                    "duplicate_group": video.get("duplicate_group", 0),
+                    "duplicate_index": video.get("duplicate_index", 0),
+                    "duplicate_total": video.get("duplicate_total", 0),
+                    "duplicate_note": video.get("duplicate_note", ""),
+                })
+                self.log.emit(
+                    f"✅ {group_prefix}{os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
+                    "green"
+                )
+            return results
+
+        import numpy as np
+        sims_matrix = []
+        for txt in text_meta:
+            row = []
+            for video in video_meta:
+                row.append(score_transcript_against_copy(video["transcript"], txt["content"]))
+            sims_matrix.append(row)
+        M = len(text_meta)
+        N = len(video_meta)
+        cols = max(M, N)
+        sims_matrix = np.array(sims_matrix, dtype=np.float32)
+        if cols != N:
+            pad = np.full((M, cols - N), -1e9, dtype=np.float32)
+            sims_matrix_pad = np.hstack([sims_matrix, pad])
+        else:
+            sims_matrix_pad = sims_matrix
+        assign_cols = self._hungarian_min_cost((-sims_matrix_pad).tolist())
+        for i, j in enumerate(assign_cols):
+            if j is None or j < 0 or j >= N:
+                continue
+            txt = text_meta[i]
+            video = video_meta[j]
+            final_score = round(float(sims_matrix[i, j]) * 100, 1)
+            results.append({
+                "src_label": txt["name"],
+                "rename_name": txt["name"],
+                "res": video["path"],
+                "score": final_score,
+                "srt_path": "",
+                "tooltip": f"文案：{txt['content']}\n\n转写：{video['transcript'][:500]}",
+                "duplicate_group": video.get("duplicate_group", 0),
+                "duplicate_index": video.get("duplicate_index", 0),
+                "duplicate_total": video.get("duplicate_total", 0),
+                "duplicate_note": video.get("duplicate_note", ""),
+            })
+            self.log.emit(
+                f"✅ {group_prefix}{os.path.basename(video['path'])} → {txt['name']} (音频匹配得分: {final_score})",
+                "green"
+            )
         return results
 
     def _extract_audio_wav(self, media_path):
@@ -8890,6 +9016,7 @@ class VideoCopyMatchThread(QThread):
                         "transcript": transcript,
                         "engine": engine_used,
                         "segments": transcribed.get("segments") or [],
+                        "folder_group": compute_relative_group_key(path, self.media_roots),
                     })
                     self.log.emit(
                         f"📝 已转写 {os.path.basename(path)} ({engine_used})：{smart_wrap_text(transcript[:80])}",
@@ -8923,6 +9050,8 @@ class VideoCopyMatchThread(QThread):
                     text_meta.append({
                         "name": clean_long_filename(item.get("name") or build_copy_match_name(text, idx + 1), max_len=80),
                         "content": text,
+                        "source_path": str(item.get("source_path", "") or ""),
+                        "folder_group": str(item.get("folder_group", "") or ""),
                     })
                 except Exception as e:
                     self.log.emit(f"⚠️ 文案处理失败，已跳过第 {idx + 1} 段：{e}", "orange")
@@ -8932,82 +9061,43 @@ class VideoCopyMatchThread(QThread):
                 self.error.emit("文案处理失败，无法进行匹配")
                 return
 
-            many_to_one_mode = len(video_meta) > len(text_meta)
             results = []
-
-            if many_to_one_mode:
-                self.log.emit("[音频文案匹配] 当前视频数量多于文案数量，将允许多个视频命中同一名称。", "gray")
-                for idx, video in enumerate(video_meta):
-                    best_name = ""
-                    best_text = ""
-                    best_transcript = ""
-                    best_sim = -1e9
-                    for txt in text_meta:
-                        sim = score_transcript_against_copy(video["transcript"], txt["content"])
-                        if sim > best_sim:
-                            best_sim = sim
-                            best_name = txt["name"]
-                            best_text = txt["content"]
-                            best_transcript = video["transcript"]
-                    final_score = round(best_sim * 100, 1)
-                    results.append({
-                        "src_label": best_name,
-                        "rename_name": best_name,
-                        "res": video["path"],
-                        "score": final_score,
-                        "srt_path": "",
-                        "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
-                        "duplicate_group": video.get("duplicate_group", 0),
-                        "duplicate_index": video.get("duplicate_index", 0),
-                        "duplicate_total": video.get("duplicate_total", 0),
-                        "duplicate_note": video.get("duplicate_note", ""),
-                    })
-                    self.log.emit(
-                        f"✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
-                        "green"
-                    )
-                    self.progress.emit(70 + int((idx + 1) / max(1, len(video_meta)) * 30))
-            else:
-                import numpy as np
-                sims_matrix = []
+            if self.separate_by_subfolder:
+                video_groups = {}
+                text_groups = {}
+                for video in video_meta:
+                    key = str(video.get("folder_group", "") or "")
+                    video_groups.setdefault(key, []).append(video)
                 for txt in text_meta:
-                    row = []
-                    for video in video_meta:
-                        row.append(score_transcript_against_copy(video["transcript"], txt["content"]))
-                    sims_matrix.append(row)
-                M = len(text_meta)
-                N = len(video_meta)
-                cols = max(M, N)
-                sims_matrix = np.array(sims_matrix, dtype=np.float32)
-                if cols != N:
-                    pad = np.full((M, cols - N), -1e9, dtype=np.float32)
-                    sims_matrix_pad = np.hstack([sims_matrix, pad])
-                else:
-                    sims_matrix_pad = sims_matrix
-                assign_cols = self._hungarian_min_cost((-sims_matrix_pad).tolist())
-                for i, j in enumerate(assign_cols):
-                    if j is None or j < 0 or j >= N:
+                    key = str(txt.get("folder_group", "") or "")
+                    text_groups.setdefault(key, []).append(txt)
+                ordered_group_keys = sorted(video_groups.keys(), key=lambda x: (x != "", x))
+                matched_groups = 0
+                total_groups = len(ordered_group_keys)
+                for group_key in ordered_group_keys:
+                    group_label = group_key or "当前目录"
+                    group_videos = video_groups.get(group_key, []) or []
+                    group_texts = list(text_groups.get(group_key, []) or [])
+                    if not group_texts and group_key:
+                        group_texts = list(text_groups.get("", []) or [])
+                    if not group_texts:
+                        self.log.emit(
+                            f"[音频文案匹配] ⚠️ 子文件夹 {group_label} 没有对应文本，已跳过其中 {len(group_videos)} 个文件。",
+                            "orange"
+                        )
                         continue
-                    txt = text_meta[i]
-                    video = video_meta[j]
-                    final_score = round(float(sims_matrix[i, j]) * 100, 1)
-                    results.append({
-                        "src_label": txt["name"],
-                        "rename_name": txt["name"],
-                        "res": video["path"],
-                        "score": final_score,
-                        "srt_path": "",
-                        "tooltip": f"文案：{txt['content']}\n\n转写：{video['transcript'][:500]}",
-                        "duplicate_group": video.get("duplicate_group", 0),
-                        "duplicate_index": video.get("duplicate_index", 0),
-                        "duplicate_total": video.get("duplicate_total", 0),
-                        "duplicate_note": video.get("duplicate_note", ""),
-                    })
                     self.log.emit(
-                        f"✅ {os.path.basename(video['path'])} → {txt['name']} (音频匹配得分: {final_score})",
-                        "green"
+                        f"[音频文案匹配] 📁 按子文件夹独立匹配：{group_label} | 媒体 {len(group_videos)} 个 × 文本 {len(group_texts)} 段",
+                        "blue"
                     )
-                    self.progress.emit(70 + int((i + 1) / max(1, M) * 30))
+                    results.extend(self._match_group(group_videos, group_texts, group_label=group_label))
+                    matched_groups += 1
+                    self.progress.emit(70 + int(matched_groups / max(1, total_groups) * 30))
+                if not results:
+                    self.error.emit("按子文件夹独立匹配时，没有找到任何可用的“媒体+文本”对应分组")
+                    return
+            else:
+                results = self._match_group(video_meta, text_meta)
 
             results.sort(key=lambda x: str(x.get("res", "")).lower())
             results = self._finalize_match_result_names(results)
@@ -21769,6 +21859,10 @@ class FileManagerPro(QMainWindow):
         self.uni_subtitle_mode_combo.addItem("按提供文本块对齐", "script_blocks")
         self.uni_subtitle_mode_combo.addItem("按 TXT 文件顺序合并对齐", "script_files")
         cfg_row.addWidget(self.uni_subtitle_mode_combo)
+        cfg_row.addSpacing(10)
+        self.uni_match_split_subfolder_check = QCheckBox("每个子文件夹单独匹配")
+        self.uni_match_split_subfolder_check.setToolTip("勾选后，会按相对同名子目录分别匹配；不同子文件夹之间不再共用文本，也不会把预览名称全局串号。")
+        cfg_row.addWidget(self.uni_match_split_subfolder_check)
         cfg_row.addStretch()
         copy_layout.addLayout(cfg_row)
         self.uni_match_copy_edit = QTextEdit()
@@ -21796,6 +21890,7 @@ class FileManagerPro(QMainWindow):
         self.uni_match_asr_model_combo.currentTextChanged.connect(self.trigger_save)
         self.uni_subtitle_mode_combo.currentIndexChanged.connect(self.update_universal_match_mode_ui)
         self.uni_subtitle_mode_combo.currentTextChanged.connect(self.trigger_save)
+        self.uni_match_split_subfolder_check.toggled.connect(self.trigger_save)
         self.uni_match_copy_edit.textChanged.connect(self.trigger_save)
         self.update_universal_match_mode_ui()
 
@@ -21925,6 +22020,8 @@ class FileManagerPro(QMainWindow):
             self.btn_uni_run_srt_only.setVisible(is_text)
         if hasattr(self, "btn_uni_run_txt_only"):
             self.btn_uni_run_txt_only.setVisible(is_text)
+        if hasattr(self, "uni_match_split_subfolder_check"):
+            self.uni_match_split_subfolder_check.setVisible(is_text)
         subtitle_mode = str(self.uni_subtitle_mode_combo.currentData() or "transcribe") if hasattr(self, "uni_subtitle_mode_combo") else "transcribe"
         is_script_mode = subtitle_mode in {"script_blocks", "script_files"}
         if hasattr(self, "uni_match_copy_tip"):
@@ -21972,7 +22069,12 @@ class FileManagerPro(QMainWindow):
         if not media_source:
             QMessageBox.warning(self, "提示", "请先设置音频/视频来源；你也可以直接拖一个同时含视频和 txt 的总文件夹")
             return
-        copy_items = build_copy_items_from_sources(text_source, raw_copy)
+        separate_by_subfolder = bool(self.uni_match_split_subfolder_check.isChecked()) if hasattr(self, "uni_match_split_subfolder_check") else False
+        copy_items = build_copy_items_from_sources(
+            text_source,
+            raw_copy,
+            dedup_scope=("folder" if separate_by_subfolder else "global")
+        )
         if not copy_items:
             QMessageBox.warning(self, "提示", "没有找到可比对的文本。你可以拖入 txt 文件/文件夹，或在下方直接填写“名字|文案”内容。")
             return
@@ -21989,7 +22091,8 @@ class FileManagerPro(QMainWindow):
             copy_items,
             clip_model_name=clip_model_name,
             clip_use_gpu=clip_use_gpu,
-            ai_config=ai_cfg
+            ai_config=ai_cfg,
+            separate_by_subfolder=separate_by_subfolder
         )
         self.uni_copy_match_thread.progress.connect(self.uni_progress_bar.setValue)
         self.uni_copy_match_thread.log.connect(self.log)
