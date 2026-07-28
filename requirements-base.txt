@@ -1,0 +1,15 @@
+# 基础运行依赖
+# 目标：先保证程序能启动、界面能开、视频拼接/表格/文件整理等基础功能可用
+
+requests
+urllib3
+PyQt6
+pyautogui
+pyperclip
+pillow
+opencv-python
+markdown
+pandas
+openpyxl
+numpy
+python-vlc

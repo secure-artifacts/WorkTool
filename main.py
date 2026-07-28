@@ -8498,6 +8498,94 @@ class VideoCopyMatchThread(QThread):
         seen = set()
         return [x for x in files if not (x in seen or seen.add(x))]
 
+    def _build_media_duplicate_signature(self, media_path, sample_size=1024 * 1024):
+        media_path = str(media_path or "").strip()
+        if not media_path or not os.path.isfile(media_path):
+            return ""
+        try:
+            size = os.path.getsize(media_path)
+            md5 = hashlib.md5()
+            with open(media_path, "rb") as f:
+                if size <= sample_size * 3:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        md5.update(chunk)
+                else:
+                    md5.update(f.read(sample_size))
+                    mid_pos = max(0, (size // 2) - (sample_size // 2))
+                    f.seek(mid_pos)
+                    md5.update(f.read(sample_size))
+                    tail_pos = max(0, size - sample_size)
+                    f.seek(tail_pos)
+                    md5.update(f.read(sample_size))
+            return f"{size}:{md5.hexdigest()}"
+        except Exception:
+            return ""
+
+    def _annotate_duplicate_videos(self, video_meta):
+        grouped = {}
+        duplicate_groups = 0
+        duplicate_videos = 0
+        for item in video_meta or []:
+            signature = self._build_media_duplicate_signature(item.get("path", ""))
+            item["duplicate_signature"] = signature
+            item["duplicate_group"] = 0
+            item["duplicate_index"] = 0
+            item["duplicate_total"] = 0
+            item["duplicate_note"] = ""
+            if signature:
+                grouped.setdefault(signature, []).append(item)
+        for _, items in grouped.items():
+            if len(items) <= 1:
+                continue
+            duplicate_groups += 1
+            ordered_items = sorted(items, key=lambda x: str(x.get("path", "") or "").lower())
+            duplicate_videos += len(ordered_items)
+            ref_name = os.path.basename(str(ordered_items[0].get("path", "") or "").strip())
+            total = len(ordered_items)
+            for idx, item in enumerate(ordered_items, 1):
+                item["duplicate_group"] = duplicate_groups
+                item["duplicate_index"] = idx
+                item["duplicate_total"] = total
+                if idx == 1:
+                    item["duplicate_note"] = f"重复素材组 {duplicate_groups}：基准文件，共 {total} 个相同视频"
+                else:
+                    item["duplicate_note"] = f"重复素材组 {duplicate_groups}：与 {ref_name} 重复（第 {idx}/{total} 个）"
+        return duplicate_groups, duplicate_videos
+
+    def _finalize_match_result_names(self, results):
+        used_names = set()
+        for item in results or []:
+            base_name = clean_long_filename(
+                str(item.get("rename_name", "") or item.get("src_label", "") or "").strip(),
+                max_len=80
+            ).strip()
+            if not base_name:
+                base_name = clean_long_filename(
+                    os.path.splitext(os.path.basename(str(item.get("res", "") or "")))[0],
+                    max_len=80
+                ).strip()
+            dup_total = int(item.get("duplicate_total", 0) or 0)
+            dup_index = int(item.get("duplicate_index", 0) or 0)
+            preferred_name = base_name
+            if dup_total > 1 and dup_index > 1:
+                repeat_prefix = "重复-" if dup_index == 2 else f"重复{dup_index - 1}-"
+                preferred_name = clean_long_filename(f"{repeat_prefix}{base_name}", max_len=80) or f"repeat_{dup_index}_{base_name}"
+            candidate = preferred_name or base_name or "match_result"
+            seq = 2
+            while candidate in used_names:
+                candidate = clean_long_filename(f"{preferred_name}_{seq}", max_len=80) or f"{preferred_name}_{seq}"
+                seq += 1
+            used_names.add(candidate)
+            item["rename_name"] = candidate
+            duplicate_note = str(item.get("duplicate_note", "") or "").strip()
+            tooltip = str(item.get("tooltip", "") or "").strip()
+            if duplicate_note and duplicate_note not in tooltip:
+                item["tooltip"] = f"{duplicate_note}\n\n{tooltip}" if tooltip else duplicate_note
+        return results
+
     def _extract_audio_wav(self, media_path):
         temp_wav = os.path.join(
             tempfile.gettempdir(),
@@ -8821,6 +8909,13 @@ class VideoCopyMatchThread(QThread):
                 self.error.emit("所有视频都无法完成音频转写，无法进行文案匹配")
                 return
 
+            duplicate_groups, duplicate_videos = self._annotate_duplicate_videos(video_meta)
+            if duplicate_groups > 0:
+                self.log.emit(
+                    f"[音频文案匹配] ⚠️ 检测到 {duplicate_groups} 组疑似重复视频，共 {duplicate_videos} 个文件；结果里会自动标记“重复2/重复3”方便区分。",
+                    "orange"
+                )
+
             text_meta = []
             for idx, item in enumerate(copy_items):
                 try:
@@ -8862,6 +8957,10 @@ class VideoCopyMatchThread(QThread):
                         "score": final_score,
                         "srt_path": "",
                         "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
+                        "duplicate_group": video.get("duplicate_group", 0),
+                        "duplicate_index": video.get("duplicate_index", 0),
+                        "duplicate_total": video.get("duplicate_total", 0),
+                        "duplicate_note": video.get("duplicate_note", ""),
                     })
                     self.log.emit(
                         f"✅ {os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
@@ -8899,6 +8998,10 @@ class VideoCopyMatchThread(QThread):
                         "score": final_score,
                         "srt_path": "",
                         "tooltip": f"文案：{txt['content']}\n\n转写：{video['transcript'][:500]}",
+                        "duplicate_group": video.get("duplicate_group", 0),
+                        "duplicate_index": video.get("duplicate_index", 0),
+                        "duplicate_total": video.get("duplicate_total", 0),
+                        "duplicate_note": video.get("duplicate_note", ""),
                     })
                     self.log.emit(
                         f"✅ {os.path.basename(video['path'])} → {txt['name']} (音频匹配得分: {final_score})",
@@ -8907,6 +9010,7 @@ class VideoCopyMatchThread(QThread):
                     self.progress.emit(70 + int((i + 1) / max(1, M) * 30))
 
             results.sort(key=lambda x: str(x.get("res", "")).lower())
+            results = self._finalize_match_result_names(results)
             self.progress.emit(100)
             self.log.emit(f"[音频文案匹配] ✅ 完成，共生成 {len(results)} 组命名建议。", "green")
             self.result.emit(results)
@@ -11332,10 +11436,14 @@ class ConcatSourceTable(QTableWidget):
         for row in rows:
             index_item = self.item(row, 0)
             name_item = self.item(row, 1)
-            idx_text = index_item.text().strip() if index_item else ""
+            index_text = index_item.text().strip() if index_item else ""
             name_text = name_item.text().strip() if name_item else ""
-            if idx_text:
-                text_rows.append(f"{name_text} ({idx_text})" if name_text else idx_text)
+            if name_text and index_text:
+                text_rows.append(f"{name_text} ({index_text})")
+            elif name_text:
+                text_rows.append(name_text)
+            elif index_text:
+                text_rows.append(index_text)
         data = QMimeData()
         data.setText("\n".join(text_rows))
         return data
@@ -11345,7 +11453,6 @@ class ConcatGroupTable(QTableWidget):
     def __init__(self, rows=12, material_cols=8, parent=None):
         super().__init__(rows, 1 + material_cols, parent)
         self.material_cols = material_cols
-        self.token_display_resolver = None
         self.setHorizontalHeaderLabels(["输出名"] + [f"素材{i}" for i in range(1, material_cols + 1)])
         self.verticalHeader().setVisible(False)
         self.setAcceptDrops(True)
@@ -11404,14 +11511,7 @@ class ConcatGroupTable(QTableWidget):
             if not item:
                 item = QTableWidgetItem("")
                 self.setItem(row, target_col, item)
-            display_token = token
-            resolver = getattr(self, "token_display_resolver", None)
-            if callable(resolver):
-                try:
-                    display_token = resolver(token)
-                except Exception:
-                    display_token = token
-            item.setText(display_token)
+            item.setText(token)
         self.setCurrentCell(row, min(self.columnCount() - 1, col + len(tokens) - 1))
         event.acceptProposedAction()
 
@@ -13085,6 +13185,9 @@ class VideoConcatTab(QWidget):
         self.trim_pending_seek_seconds = 0.0
         self.trim_last_timeline_update_ts = 0.0
         self.trim_last_position_ui_sync_ts = 0.0
+        self.concat_auto_rule_config = self._default_concat_auto_rule_config()
+        self.concat_auto_rule_presets = {}
+        self.concat_auto_rule_active_preset = "严格成片"
         self._loading_subtitle_style = False
         self.subtitle_custom_presets = {}
         self.trim_play_timer = QTimer(self)
@@ -13104,6 +13207,143 @@ class VideoConcatTab(QWidget):
 
     def _set_subtitle_color_button(self, btn, color):
         btn.setStyleSheet(f"background: {color}; border: 1px solid #94a3b8; border-radius: 4px;")
+
+    def _default_concat_auto_rule_config(self):
+        return {
+            "filename_mode": "numeric_only",
+            "custom_regex": "",
+            "require_same_name_txt": True,
+            "require_nonempty_txt": False,
+            "sequence_rule": "from_1",
+            "sequence_gap_action": "skip_group",
+            "duplicate_rule": "keep_all",
+            "include_keywords": "",
+            "exclude_keywords": "",
+            "ignore_hidden_temp": True,
+            "sort_mode": "number",
+        }
+
+    def _concat_builtin_rule_presets(self):
+        return {
+            "严格成片": self._normalize_concat_auto_rule_config({
+                "filename_mode": "numeric_only",
+                "require_same_name_txt": True,
+                "require_nonempty_txt": False,
+                "sequence_rule": "from_1",
+                "sequence_gap_action": "skip_group",
+                "duplicate_rule": "keep_all",
+                "sort_mode": "number",
+            }),
+            "数字开头+TXT": self._normalize_concat_auto_rule_config({
+                "filename_mode": "starts_with_number",
+                "require_same_name_txt": True,
+                "sequence_rule": "consecutive",
+                "sequence_gap_action": "skip_group",
+                "duplicate_rule": "keep_all",
+                "sort_mode": "number",
+            }),
+            "宽松整理": self._normalize_concat_auto_rule_config({
+                "filename_mode": "numeric_only",
+                "require_same_name_txt": False,
+                "sequence_rule": "any",
+                "sequence_gap_action": "keep_existing",
+                "duplicate_rule": "keep_all",
+                "sort_mode": "number",
+            }),
+            "去重优先": self._normalize_concat_auto_rule_config({
+                "filename_mode": "numeric_only",
+                "require_same_name_txt": True,
+                "sequence_rule": "from_1",
+                "sequence_gap_action": "skip_group",
+                "duplicate_rule": "keep_first",
+                "sort_mode": "number",
+            }),
+        }
+
+    def _normalize_concat_auto_rule_config(self, cfg=None):
+        base = dict(self._default_concat_auto_rule_config())
+        if isinstance(cfg, dict):
+            base.update(cfg)
+        base["filename_mode"] = str(base.get("filename_mode", "numeric_only") or "numeric_only").strip() or "numeric_only"
+        base["custom_regex"] = str(base.get("custom_regex", "") or "").strip()
+        base["require_same_name_txt"] = bool(base.get("require_same_name_txt", True))
+        base["require_nonempty_txt"] = bool(base.get("require_nonempty_txt", False))
+        base["sequence_rule"] = str(base.get("sequence_rule", "from_1") or "from_1").strip() or "from_1"
+        base["sequence_gap_action"] = str(base.get("sequence_gap_action", "skip_group") or "skip_group").strip() or "skip_group"
+        base["duplicate_rule"] = str(base.get("duplicate_rule", "keep_all") or "keep_all").strip() or "keep_all"
+        base["include_keywords"] = str(base.get("include_keywords", "") or "").strip()
+        base["exclude_keywords"] = str(base.get("exclude_keywords", "") or "").strip()
+        base["ignore_hidden_temp"] = bool(base.get("ignore_hidden_temp", True))
+        base["sort_mode"] = str(base.get("sort_mode", "number") or "number").strip() or "number"
+        return base
+
+    def _normalize_concat_auto_rule_presets(self, presets=None):
+        normalized = {}
+        if not isinstance(presets, dict):
+            return normalized
+        for name, cfg in presets.items():
+            preset_name = str(name or "").strip()
+            if not preset_name:
+                continue
+            normalized[preset_name] = self._normalize_concat_auto_rule_config(cfg)
+        return normalized
+
+    def _all_concat_rule_presets(self):
+        presets = dict(self._concat_builtin_rule_presets())
+        presets.update(self._normalize_concat_auto_rule_presets(getattr(self, "concat_auto_rule_presets", {})))
+        return presets
+
+    def _split_concat_rule_keywords(self, raw_text):
+        return [kw.strip().lower() for kw in re.split(r"[\n,，;；|]+", str(raw_text or "")) if kw.strip()]
+
+    def _get_concat_rule_summary(self):
+        cfg = self._normalize_concat_auto_rule_config(getattr(self, "concat_auto_rule_config", {}))
+        active_preset = str(getattr(self, "concat_auto_rule_active_preset", "") or "").strip()
+        filename_map = {
+            "any": "文件名不限",
+            "numeric_only": "仅纯数字文件名",
+            "starts_with_number": "仅数字开头文件名",
+            "regex": f"自定义正则：{cfg.get('custom_regex') or '未填写'}",
+        }
+        seq_map = {
+            "any": "序号不限",
+            "consecutive": "序号必须连续",
+            "from_1": "必须从 1 开始连续",
+        }
+        gap_map = {
+            "skip_group": "缺号整组跳过",
+            "keep_existing": "缺号保留现有项",
+            "keep_prefix": "缺号只保留前面连续段",
+        }
+        dup_map = {
+            "keep_all": "重复素材全部保留",
+            "keep_first": "重复素材只保留首个",
+            "skip_group": "发现重复整组跳过",
+        }
+        parts = []
+        if active_preset:
+            parts.append(f"预设：{active_preset}")
+        parts.append(filename_map.get(cfg.get("filename_mode"), "文件名不限"))
+        parts.append("必须有同名TXT" if cfg.get("require_same_name_txt") else "TXT可选")
+        if cfg.get("require_nonempty_txt"):
+            parts.append("TXT不能为空")
+        parts.append(seq_map.get(cfg.get("sequence_rule"), "序号不限"))
+        if cfg.get("sequence_rule") != "any":
+            parts.append(gap_map.get(cfg.get("sequence_gap_action"), "缺号整组跳过"))
+        parts.append(dup_map.get(cfg.get("duplicate_rule"), "重复素材全部保留"))
+        include_keywords = self._split_concat_rule_keywords(cfg.get("include_keywords", ""))
+        exclude_keywords = self._split_concat_rule_keywords(cfg.get("exclude_keywords", ""))
+        if include_keywords:
+            parts.append(f"包含关键词：{' / '.join(include_keywords[:3])}" + (" ..." if len(include_keywords) > 3 else ""))
+        if exclude_keywords:
+            parts.append(f"排除关键词：{' / '.join(exclude_keywords[:3])}" + (" ..." if len(exclude_keywords) > 3 else ""))
+        if cfg.get("ignore_hidden_temp"):
+            parts.append("忽略隐藏/临时文件")
+        return "当前智能组合规则：" + "；".join(parts)
+
+    def _refresh_concat_rule_summary_label(self):
+        if hasattr(self, "concat_rule_summary_label"):
+            self.concat_rule_summary_label.setText(self._get_concat_rule_summary())
 
     def _subtitle_offset_slider_to_value(self, slider_value):
         try:
@@ -13701,7 +13941,7 @@ class VideoConcatTab(QWidget):
 
         rule_group = QGroupBox("拼接组合规则")
         rule_layout = QVBoxLayout(rule_group)
-        table_tip = QLabel("表格模式：左边素材表会自动列出编号；可把左表选中行直接拖到右表“素材列”，也可以直接粘贴 Excel/编号。")
+        table_tip = QLabel("表格模式：左边素材表会自动列出“文件名（编号）”；可把左表选中行直接拖到右表“素材列”，也可以继续直接粘贴 Excel/编号。")
         table_tip.setWordWrap(True)
         table_tip.setStyleSheet("color:#475569;")
         rule_layout.addWidget(table_tip)
@@ -13719,6 +13959,9 @@ class VideoConcatTab(QWidget):
         btn_auto_concat_folder = QPushButton("按文件夹智能组合")
         btn_auto_concat_folder.clicked.connect(self.auto_fill_concat_groups_by_folder)
         table_top_btns.addWidget(btn_auto_concat_folder)
+        btn_concat_rule_window = QPushButton("组合规则...")
+        btn_concat_rule_window.clicked.connect(self.show_concat_rule_dialog)
+        table_top_btns.addWidget(btn_concat_rule_window)
         self.concat_include_single_folder_check = QCheckBox("包含单个视频文件夹")
         self.concat_include_single_folder_check.setChecked(False)
         self.concat_include_single_folder_check.setToolTip("勾选后，智能组合时只有 1 个视频的文件夹也会生成任务，执行时直接整理到输出目录")
@@ -13726,6 +13969,11 @@ class VideoConcatTab(QWidget):
         table_top_btns.addWidget(self.concat_include_single_folder_check)
         table_top_btns.addStretch()
         rule_layout.addLayout(table_top_btns)
+        self.concat_rule_summary_label = QLabel()
+        self.concat_rule_summary_label.setWordWrap(True)
+        self.concat_rule_summary_label.setStyleSheet("color:#475569; background:#f8fafc; padding:8px; border:1px solid #e2e8f0; border-radius:6px;")
+        rule_layout.addWidget(self.concat_rule_summary_label)
+        self._refresh_concat_rule_summary_label()
 
         table_split = QSplitter(_Horizontal)
         source_wrap = QWidget()
@@ -13742,9 +13990,7 @@ class VideoConcatTab(QWidget):
         group_v.setContentsMargins(0, 0, 0, 0)
         group_v.addWidget(QLabel("组合表（每行一个成片）"))
         self.concat_group_table = ConcatGroupTable(rows=12, material_cols=8)
-        self.concat_group_table.token_display_resolver = self._format_concat_group_token_for_display
         self.concat_group_table.itemChanged.connect(lambda *_: self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit())
-        self.concat_group_table.itemChanged.connect(self._on_concat_group_table_item_changed)
         group_v.addWidget(self.concat_group_table)
         table_split.addWidget(group_wrap)
         table_split.setStretchFactor(0, 2)
@@ -15582,6 +15828,9 @@ class VideoConcatTab(QWidget):
             "concat_crf": self.concat_crf_spin.value(),
             "concat_preset": self.concat_preset_combo.currentText(),
             "concat_include_single_folder": self.concat_include_single_folder_check.isChecked() if hasattr(self, "concat_include_single_folder_check") else False,
+            "concat_auto_rule_config": self._normalize_concat_auto_rule_config(getattr(self, "concat_auto_rule_config", {})),
+            "concat_auto_rule_presets": self._normalize_concat_auto_rule_presets(getattr(self, "concat_auto_rule_presets", {})),
+            "concat_auto_rule_active_preset": str(getattr(self, "concat_auto_rule_active_preset", "") or "").strip(),
             "concat_transition": self.concat_transition_check.isChecked() if hasattr(self, "concat_transition_check") else False,
             "concat_transition_dur": self.concat_transition_dur.value() if hasattr(self, "concat_transition_dur") else 0.5,
             "concat_transition_audio": self.concat_transition_audio_check.isChecked() if hasattr(self, "concat_transition_audio_check") else True,
@@ -15661,6 +15910,10 @@ class VideoConcatTab(QWidget):
         self.concat_output_ext_combo.setCurrentText(str(c.get("concat_output_ext", "mp4") or "mp4"))
         self.concat_crf_spin.setValue(int(c.get("concat_crf", 23) or 23))
         self.concat_preset_combo.setCurrentText(str(c.get("concat_preset", "veryfast") or "veryfast"))
+        self.concat_auto_rule_presets = self._normalize_concat_auto_rule_presets(c.get("concat_auto_rule_presets", {}))
+        self.concat_auto_rule_active_preset = str(c.get("concat_auto_rule_active_preset", "严格成片") or "严格成片").strip()
+        self.concat_auto_rule_config = self._normalize_concat_auto_rule_config(c.get("concat_auto_rule_config", {}))
+        self._refresh_concat_rule_summary_label()
         if hasattr(self, "concat_include_single_folder_check"):
             self.concat_include_single_folder_check.setChecked(bool(c.get("concat_include_single_folder", False)))
         if hasattr(self, "concat_transition_check"):
@@ -16010,65 +16263,35 @@ class VideoConcatTab(QWidget):
             table.setItem(row, 0, QTableWidgetItem(str(idx)))
             table.setItem(row, 1, QTableWidgetItem(os.path.basename(path)))
             table.setItem(row, 2, QTableWidgetItem(path))
-        self._refresh_concat_group_table_labels()
 
-    def _format_concat_material_label(self, path, idx=""):
-        name = os.path.basename(path or "").strip()
-        idx_text = str(idx or "").strip()
-        if name and idx_text:
-            return f"{name} ({idx_text})"
-        return name or idx_text
+    def _format_concat_group_token(self, path, idx=None):
+        name_text = os.path.basename(str(path or "").strip())
+        index_text = str(idx).strip() if idx not in (None, "") else ""
+        if name_text and index_text:
+            return f"{name_text} ({index_text})"
+        return name_text or index_text
 
-    def _format_concat_group_token_for_display(self, token):
+    def _extract_concat_token_index(self, token):
         raw = str(token or "").strip()
         if not raw:
+            return "", ""
+        m = re.match(r"^(.*?)[（(]\s*(\d+)\s*[）)]\s*$", raw)
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+        return raw, ""
+
+    def _format_concat_preview_name(self, path, refs=None):
+        raw_path = str(path or "").strip()
+        if not raw_path:
             return ""
-        videos = self._collect_videos()
-        if not videos:
-            return raw
-        refs = self._build_video_refs(videos)
-        resolved, err = self._resolve_group_token(raw, refs)
-        if err or not resolved:
-            return raw
-        idx = refs.get("path_to_index", {}).get(os.path.normcase(os.path.abspath(resolved)), "")
-        return self._format_concat_material_label(resolved, idx)
-
-    def _refresh_concat_group_table_labels(self):
-        table = getattr(self, "concat_group_table", None)
-        if not table:
-            return
-        table.blockSignals(True)
-        try:
-            for row in range(table.rowCount()):
-                for col in range(1, table.columnCount()):
-                    item = table.item(row, col)
-                    if not item:
-                        continue
-                    raw = item.text().strip()
-                    if not raw:
-                        continue
-                    pretty = self._format_concat_group_token_for_display(raw)
-                    if pretty and pretty != raw:
-                        item.setText(pretty)
-        finally:
-            table.blockSignals(False)
-
-    def _on_concat_group_table_item_changed(self, item):
-        if getattr(self, "_concat_group_table_formatting", False):
-            return
-        if not item or item.column() < 1:
-            return
-        raw = item.text().strip()
-        if not raw:
-            return
-        pretty = self._format_concat_group_token_for_display(raw)
-        if not pretty or pretty == raw:
-            return
-        self._concat_group_table_formatting = True
-        try:
-            item.setText(pretty)
-        finally:
-            self._concat_group_table_formatting = False
+        idx = ""
+        if isinstance(refs, dict):
+            full_map = refs.get("full", {}) or {}
+            norm_path = os.path.normcase(os.path.abspath(raw_path))
+            actual_path = full_map.get(norm_path, raw_path)
+            idx = str((refs.get("path_to_index", {}) or {}).get(os.path.normcase(os.path.abspath(actual_path)), "")).strip()
+            raw_path = actual_path
+        return self._format_concat_group_token(raw_path, idx)
 
     def add_concat_table_row(self):
         row = self.concat_group_table.rowCount()
@@ -16099,7 +16322,11 @@ class VideoConcatTab(QWidget):
         src_item = self.concat_source_table.item(row, 0)
         if not src_item:
             return
-        token = self._format_concat_group_token_for_display(src_item.text().strip())
+        path_item = self.concat_source_table.item(row, 2)
+        token = self._format_concat_group_token(
+            path_item.text().strip() if path_item else "",
+            src_item.text().strip()
+        )
         current_row = self.concat_group_table.currentRow()
         current_col = self.concat_group_table.currentColumn()
         if current_row < 0:
@@ -16134,8 +16361,6 @@ class VideoConcatTab(QWidget):
             row_vals = data[r] if r < len(data) and isinstance(data[r], list) else []
             for c in range(self.concat_group_table.columnCount()):
                 val = str(row_vals[c]) if c < len(row_vals) else ""
-                if c >= 1 and val:
-                    val = self._format_concat_group_token_for_display(val)
                 self.concat_group_table.setItem(r, c, QTableWidgetItem(val))
         self.concat_group_table.blockSignals(False)
 
@@ -16304,6 +16529,438 @@ class VideoConcatTab(QWidget):
         check = getattr(self, "concat_include_single_folder_check", None)
         return bool(check and check.isChecked())
 
+    def show_concat_rule_dialog(self):
+        current_cfg = self._normalize_concat_auto_rule_config(getattr(self, "concat_auto_rule_config", {}))
+        current_preset_name = [str(getattr(self, "concat_auto_rule_active_preset", "") or "").strip()]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("按文件夹智能组合规则")
+        dlg.resize(780, 780)
+        layout = QVBoxLayout(dlg)
+
+        intro = QLabel(
+            "这里控制“按文件夹智能组合”时，哪些视频才算最终素材。\n"
+            "默认规则仍然是你当前要求的严格模式：纯数字命名 + 必须有同名 TXT + 序号从 1 开始连续。"
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#1d4ed8; background:#eff6ff; padding:10px; border-radius:6px;")
+        layout.addWidget(intro)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("规则预设:"))
+        preset_combo = QComboBox()
+        preset_row.addWidget(preset_combo, 1)
+        btn_load_preset = QPushButton("载入预设")
+        btn_save_as_preset = QPushButton("另存为预设")
+        btn_overwrite_preset = QPushButton("覆盖当前预设")
+        btn_delete_preset = QPushButton("删除当前预设")
+        preset_row.addWidget(btn_load_preset)
+        preset_row.addWidget(btn_save_as_preset)
+        preset_row.addWidget(btn_overwrite_preset)
+        preset_row.addWidget(btn_delete_preset)
+        layout.addLayout(preset_row)
+
+        preset_status_label = QLabel("")
+        preset_status_label.setWordWrap(True)
+        preset_status_label.setStyleSheet("color:#475569; background:#f8fafc; padding:8px; border-radius:6px;")
+        layout.addWidget(preset_status_label)
+
+        form = QVBoxLayout()
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("文件名规则:"))
+        filename_mode_combo = QComboBox()
+        filename_mode_combo.addItem("不限", "any")
+        filename_mode_combo.addItem("必须纯数字", "numeric_only")
+        filename_mode_combo.addItem("必须数字开头", "starts_with_number")
+        filename_mode_combo.addItem("自定义正则", "regex")
+        self._set_combo_by_data(filename_mode_combo, current_cfg.get("filename_mode", "numeric_only"))
+        row1.addWidget(filename_mode_combo)
+        row1.addWidget(QLabel("排序方式:"))
+        sort_mode_combo = QComboBox()
+        sort_mode_combo.addItem("按数字序号", "number")
+        sort_mode_combo.addItem("自然排序", "natural")
+        self._set_combo_by_data(sort_mode_combo, current_cfg.get("sort_mode", "number"))
+        row1.addWidget(sort_mode_combo)
+        row1.addStretch()
+        form.addLayout(row1)
+
+        regex_label = QLabel("自定义正则：")
+        regex_edit = QLineEdit()
+        regex_edit.setPlaceholderText(r"例如：^\d+$ 或 ^\d+_[A-Za-z]+$")
+        regex_edit.setText(current_cfg.get("custom_regex", ""))
+        regex_row = QHBoxLayout()
+        regex_row.addWidget(regex_label)
+        regex_row.addWidget(regex_edit)
+        form.addLayout(regex_row)
+
+        row2 = QHBoxLayout()
+        require_txt_check = QCheckBox("必须有同名 TXT")
+        require_txt_check.setChecked(bool(current_cfg.get("require_same_name_txt", True)))
+        row2.addWidget(require_txt_check)
+        require_nonempty_txt_check = QCheckBox("TXT 不能为空")
+        require_nonempty_txt_check.setChecked(bool(current_cfg.get("require_nonempty_txt", False)))
+        row2.addWidget(require_nonempty_txt_check)
+        ignore_hidden_check = QCheckBox("忽略隐藏/临时文件")
+        ignore_hidden_check.setChecked(bool(current_cfg.get("ignore_hidden_temp", True)))
+        row2.addWidget(ignore_hidden_check)
+        row2.addStretch()
+        form.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("序号规则:"))
+        sequence_combo = QComboBox()
+        sequence_combo.addItem("不限制", "any")
+        sequence_combo.addItem("必须连续", "consecutive")
+        sequence_combo.addItem("必须从 1 开始连续", "from_1")
+        self._set_combo_by_data(sequence_combo, current_cfg.get("sequence_rule", "from_1"))
+        row3.addWidget(sequence_combo)
+        row3.addWidget(QLabel("缺号处理:"))
+        gap_action_combo = QComboBox()
+        gap_action_combo.addItem("整组跳过", "skip_group")
+        gap_action_combo.addItem("保留现有项", "keep_existing")
+        gap_action_combo.addItem("只保留前面连续段", "keep_prefix")
+        self._set_combo_by_data(gap_action_combo, current_cfg.get("sequence_gap_action", "skip_group"))
+        row3.addWidget(gap_action_combo)
+        row3.addStretch()
+        form.addLayout(row3)
+
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("重复素材处理:"))
+        duplicate_combo = QComboBox()
+        duplicate_combo.addItem("全部保留", "keep_all")
+        duplicate_combo.addItem("只保留首个", "keep_first")
+        duplicate_combo.addItem("发现重复整组跳过", "skip_group")
+        self._set_combo_by_data(duplicate_combo, current_cfg.get("duplicate_rule", "keep_all"))
+        row4.addWidget(duplicate_combo)
+        row4.addStretch()
+        form.addLayout(row4)
+
+        include_label = QLabel("必须包含关键词：")
+        include_edit = QTextEdit()
+        include_edit.setPlaceholderText("可填多个关键词，支持换行、逗号、分号分隔。\n只有命中这些关键词的视频才参与智能组合。")
+        include_edit.setFixedHeight(90)
+        include_edit.setPlainText(current_cfg.get("include_keywords", ""))
+        form.addWidget(include_label)
+        form.addWidget(include_edit)
+
+        exclude_label = QLabel("排除关键词：")
+        exclude_edit = QTextEdit()
+        exclude_edit.setPlaceholderText("例如：封面、样片、重复、备选、试听、草稿")
+        exclude_edit.setFixedHeight(90)
+        exclude_edit.setPlainText(current_cfg.get("exclude_keywords", ""))
+        form.addWidget(exclude_label)
+        form.addWidget(exclude_edit)
+
+        tips = QLabel(
+            "我建议你常用的几类规则：\n"
+            "1. 严格成片：纯数字 + 同名 TXT + 从 1 连续\n"
+            "2. 半自动整理：数字开头 + 同名 TXT + 连续\n"
+            "3. 特殊项目：自定义正则 + 排除关键词\n"
+            "4. 去脏素材：排除“封面/样片/重复/备选/草稿”等关键词\n"
+            "5. 去重优先：发现重复素材时只保留首个\n"
+            "6. 缺号截断：例如只有 1、2、4、5 时，只保留 1、2"
+        )
+        tips.setWordWrap(True)
+        tips.setStyleSheet("color:#475569; background:#f8fafc; padding:8px; border-radius:6px;")
+        form.addWidget(tips)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        btn_strict = QPushButton("恢复严格默认")
+        btn_cancel = QPushButton("取消")
+        btn_save = QPushButton("保存")
+        btn_row.addWidget(btn_strict)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
+
+        def _collect_dialog_rule_config():
+            return self._normalize_concat_auto_rule_config({
+                "filename_mode": filename_mode_combo.currentData(),
+                "custom_regex": regex_edit.text().strip(),
+                "require_same_name_txt": require_txt_check.isChecked(),
+                "require_nonempty_txt": require_nonempty_txt_check.isChecked(),
+                "sequence_rule": sequence_combo.currentData(),
+                "sequence_gap_action": gap_action_combo.currentData(),
+                "duplicate_rule": duplicate_combo.currentData(),
+                "include_keywords": include_edit.toPlainText().strip(),
+                "exclude_keywords": exclude_edit.toPlainText().strip(),
+                "ignore_hidden_temp": ignore_hidden_check.isChecked(),
+                "sort_mode": sort_mode_combo.currentData(),
+            })
+
+        def _refresh_preset_combo(select_name=""):
+            builtin_names = set(self._concat_builtin_rule_presets().keys())
+            custom_presets = self._normalize_concat_auto_rule_presets(getattr(self, "concat_auto_rule_presets", {}))
+            preset_combo.blockSignals(True)
+            preset_combo.clear()
+            preset_combo.addItem("当前未保存规则", "__current__")
+            for name in builtin_names:
+                preset_combo.addItem(f"内置 · {name}", f"builtin:{name}")
+            for name in sorted(custom_presets.keys()):
+                preset_combo.addItem(f"自定义 · {name}", f"custom:{name}")
+            target_data = "__current__"
+            if select_name:
+                if select_name in custom_presets:
+                    target_data = f"custom:{select_name}"
+                elif select_name in builtin_names:
+                    target_data = f"builtin:{select_name}"
+            idx = preset_combo.findData(target_data)
+            preset_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            preset_combo.blockSignals(False)
+
+        def _refresh_preset_status():
+            active_name = str(current_preset_name[0] or "").strip()
+            if active_name:
+                preset_status_label.setText(f"当前使用预设：{active_name}")
+            else:
+                preset_status_label.setText("当前为手动规则，还没有保存成预设。")
+
+        def _mark_manual(*_args):
+            current_preset_name[0] = ""
+            _refresh_preset_status()
+
+        def _load_rule_to_controls(rule_cfg, preset_name=""):
+            cfg = self._normalize_concat_auto_rule_config(rule_cfg)
+            self._set_combo_by_data(filename_mode_combo, cfg.get("filename_mode"))
+            regex_edit.setText(cfg.get("custom_regex", ""))
+            require_txt_check.setChecked(bool(cfg.get("require_same_name_txt", True)))
+            require_nonempty_txt_check.setChecked(bool(cfg.get("require_nonempty_txt", False)))
+            ignore_hidden_check.setChecked(bool(cfg.get("ignore_hidden_temp", True)))
+            self._set_combo_by_data(sequence_combo, cfg.get("sequence_rule"))
+            self._set_combo_by_data(gap_action_combo, cfg.get("sequence_gap_action"))
+            self._set_combo_by_data(duplicate_combo, cfg.get("duplicate_rule"))
+            self._set_combo_by_data(sort_mode_combo, cfg.get("sort_mode"))
+            include_edit.setPlainText(cfg.get("include_keywords", ""))
+            exclude_edit.setPlainText(cfg.get("exclude_keywords", ""))
+            current_preset_name[0] = str(preset_name or "").strip()
+            _sync_regex_enabled()
+            _refresh_preset_status()
+
+        def _sync_regex_enabled():
+            is_regex = (filename_mode_combo.currentData() == "regex")
+            regex_label.setEnabled(is_regex)
+            regex_edit.setEnabled(is_regex)
+            has_sequence = (sequence_combo.currentData() != "any")
+            gap_action_combo.setEnabled(has_sequence)
+
+        def _restore_strict():
+            strict_cfg = self._default_concat_auto_rule_config()
+            _load_rule_to_controls(strict_cfg, preset_name="严格成片")
+            _refresh_preset_combo(select_name="严格成片")
+
+        def _load_selected_preset():
+            selected = str(preset_combo.currentData() or "__current__")
+            if selected == "__current__":
+                return
+            preset_name = selected.split(":", 1)[1] if ":" in selected else ""
+            presets = self._all_concat_rule_presets()
+            preset_cfg = presets.get(preset_name)
+            if not preset_cfg:
+                QMessageBox.warning(dlg, "提示", "没有找到这个预设。")
+                return
+            _load_rule_to_controls(preset_cfg, preset_name=preset_name)
+
+        def _save_as_preset():
+            name, ok = QInputDialog.getText(dlg, "保存规则预设", "请输入预设名称：")
+            preset_name = str(name or "").strip()
+            if not ok or not preset_name:
+                return
+            if preset_name in self._concat_builtin_rule_presets():
+                QMessageBox.warning(dlg, "提示", "这个名字与内置预设重复了，请换一个名字。")
+                return
+            custom_presets = self._normalize_concat_auto_rule_presets(getattr(self, "concat_auto_rule_presets", {}))
+            custom_presets[preset_name] = _collect_dialog_rule_config()
+            self.concat_auto_rule_presets = custom_presets
+            current_preset_name[0] = preset_name
+            _refresh_preset_combo(select_name=preset_name)
+            _refresh_preset_status()
+
+        def _overwrite_current_preset():
+            preset_name = str(current_preset_name[0] or "").strip()
+            if not preset_name:
+                QMessageBox.information(dlg, "提示", "当前是手动规则，请先点“另存为预设”。")
+                return
+            if preset_name in self._concat_builtin_rule_presets():
+                QMessageBox.information(dlg, "提示", "内置预设不能直接覆盖，请另存为你自己的名字。")
+                return
+            custom_presets = self._normalize_concat_auto_rule_presets(getattr(self, "concat_auto_rule_presets", {}))
+            custom_presets[preset_name] = _collect_dialog_rule_config()
+            self.concat_auto_rule_presets = custom_presets
+            _refresh_preset_combo(select_name=preset_name)
+            _refresh_preset_status()
+
+        def _delete_current_preset():
+            selected = str(preset_combo.currentData() or "__current__")
+            if not selected.startswith("custom:"):
+                QMessageBox.information(dlg, "提示", "只能删除你自己保存的自定义预设。")
+                return
+            preset_name = selected.split(":", 1)[1]
+            custom_presets = self._normalize_concat_auto_rule_presets(getattr(self, "concat_auto_rule_presets", {}))
+            if preset_name in custom_presets:
+                del custom_presets[preset_name]
+                self.concat_auto_rule_presets = custom_presets
+            if current_preset_name[0] == preset_name:
+                current_preset_name[0] = ""
+            _refresh_preset_combo(select_name="")
+            _refresh_preset_status()
+
+        def _save():
+            next_cfg = _collect_dialog_rule_config()
+            if next_cfg.get("filename_mode") == "regex" and not next_cfg.get("custom_regex"):
+                QMessageBox.warning(dlg, "提示", "你选择了“自定义正则”，请先填写正则表达式。")
+                return
+            if next_cfg.get("filename_mode") == "regex":
+                try:
+                    re.compile(next_cfg.get("custom_regex", ""))
+                except Exception as e:
+                    QMessageBox.warning(dlg, "提示", f"正则表达式无效：{e}")
+                    return
+            self.concat_auto_rule_config = next_cfg
+            self.concat_auto_rule_active_preset = str(current_preset_name[0] or "").strip()
+            self._refresh_concat_rule_summary_label()
+            self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit()
+            dlg.accept()
+
+        for widget_signal in [
+            filename_mode_combo.currentIndexChanged,
+            sort_mode_combo.currentIndexChanged,
+            require_txt_check.toggled,
+            require_nonempty_txt_check.toggled,
+            ignore_hidden_check.toggled,
+            sequence_combo.currentIndexChanged,
+            gap_action_combo.currentIndexChanged,
+            duplicate_combo.currentIndexChanged,
+        ]:
+            widget_signal.connect(_mark_manual)
+        regex_edit.textChanged.connect(_mark_manual)
+        include_edit.textChanged.connect(_mark_manual)
+        exclude_edit.textChanged.connect(_mark_manual)
+        filename_mode_combo.currentIndexChanged.connect(_sync_regex_enabled)
+        sequence_combo.currentIndexChanged.connect(_sync_regex_enabled)
+        btn_load_preset.clicked.connect(_load_selected_preset)
+        btn_save_as_preset.clicked.connect(_save_as_preset)
+        btn_overwrite_preset.clicked.connect(_overwrite_current_preset)
+        btn_delete_preset.clicked.connect(_delete_current_preset)
+        btn_strict.clicked.connect(_restore_strict)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_save.clicked.connect(_save)
+        _refresh_preset_combo(select_name=current_preset_name[0])
+        _refresh_preset_status()
+        _sync_regex_enabled()
+        dlg.exec() if PYQT_VERSION == 6 else dlg.exec_()
+
+    def _concat_same_name_txt_path(self, video_path):
+        video_path = str(video_path or "").strip()
+        if not video_path:
+            return ""
+        txt_path = os.path.splitext(video_path)[0] + ".txt"
+        return txt_path if os.path.isfile(txt_path) else ""
+
+    def _concat_has_same_name_txt(self, video_path):
+        return bool(self._concat_same_name_txt_path(video_path))
+
+    def _concat_extract_sequence_number(self, video_path):
+        stem = os.path.splitext(os.path.basename(str(video_path or "").strip()))[0].strip()
+        if not stem:
+            return None
+        if re.fullmatch(r"\d+", stem):
+            return int(stem)
+        m = re.match(r"^(\d+)", stem)
+        if m:
+            return int(m.group(1))
+        return None
+
+    def _concat_match_filename_rule(self, stem, cfg):
+        mode = str(cfg.get("filename_mode", "numeric_only") or "numeric_only").strip()
+        stem = str(stem or "").strip()
+        if mode == "any":
+            return True
+        if mode == "numeric_only":
+            return bool(re.fullmatch(r"\d+", stem))
+        if mode == "starts_with_number":
+            return bool(re.match(r"^\d+", stem))
+        if mode == "regex":
+            pattern = str(cfg.get("custom_regex", "") or "").strip()
+            if not pattern:
+                return False
+            try:
+                return bool(re.search(pattern, stem))
+            except Exception:
+                return False
+        return True
+
+    def _concat_match_keyword_rules(self, stem, cfg):
+        stem_lower = str(stem or "").strip().lower()
+        include_keywords = self._split_concat_rule_keywords(cfg.get("include_keywords", ""))
+        exclude_keywords = self._split_concat_rule_keywords(cfg.get("exclude_keywords", ""))
+        if include_keywords and not any(kw in stem_lower for kw in include_keywords):
+            return False
+        if exclude_keywords and any(kw in stem_lower for kw in exclude_keywords):
+            return False
+        return True
+
+    def _is_concat_final_material(self, video_path, rule_cfg=None):
+        cfg = self._normalize_concat_auto_rule_config(rule_cfg or getattr(self, "concat_auto_rule_config", {}))
+        base_name = os.path.basename(str(video_path or "").strip())
+        stem = os.path.splitext(base_name)[0].strip()
+        if not stem:
+            return False
+        if cfg.get("ignore_hidden_temp") and (
+            base_name.startswith(".")
+            or base_name.startswith("~")
+            or base_name.startswith("._")
+            or stem.lower() in {"thumbs", "desktop"}
+        ):
+            return False
+        if not self._concat_match_filename_rule(stem, cfg):
+            return False
+        if not self._concat_match_keyword_rules(stem, cfg):
+            return False
+        txt_path = self._concat_same_name_txt_path(video_path)
+        if cfg.get("require_same_name_txt") and not txt_path:
+            return False
+        if cfg.get("require_nonempty_txt"):
+            if not txt_path:
+                return False
+            try:
+                with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                    if not str(f.read() or "").strip():
+                        return False
+            except Exception:
+                return False
+        return True
+
+    def _filter_concat_folder_materials(self, paths, rule_cfg=None):
+        cfg = self._normalize_concat_auto_rule_config(rule_cfg or getattr(self, "concat_auto_rule_config", {}))
+        filtered = []
+        for path in paths or []:
+            if self._is_concat_final_material(path, cfg):
+                filtered.append(path)
+        sort_mode = str(cfg.get("sort_mode", "number") or "number").strip()
+        if sort_mode == "number":
+            filtered.sort(key=lambda p: (self._concat_extract_sequence_number(p) is None, self._concat_extract_sequence_number(p) or 0, self._natural_sort_key(p)))
+        else:
+            filtered.sort(key=self._natural_sort_key)
+        sequence_rule = str(cfg.get("sequence_rule", "from_1") or "from_1").strip()
+        if sequence_rule != "any" and filtered:
+            seq_numbers = [self._concat_extract_sequence_number(path) for path in filtered]
+            if any(num is None for num in seq_numbers):
+                return []
+            unique_numbers = sorted(set(seq_numbers))
+            if len(unique_numbers) != len(seq_numbers):
+                return []
+            if sequence_rule == "consecutive":
+                expected = list(range(unique_numbers[0], unique_numbers[0] + len(unique_numbers)))
+                if unique_numbers != expected:
+                    return []
+            elif sequence_rule == "from_1":
+                expected = list(range(1, len(unique_numbers) + 1))
+                if unique_numbers != expected:
+                    return []
+        return filtered
+
     def auto_fill_concat_groups_by_folder(self):
         videos = self._collect_videos()
         if not videos:
@@ -16317,17 +16974,18 @@ class VideoConcatTab(QWidget):
         valid_groups = []
         single_group_count = 0
         for folder, paths in folder_groups.items():
-            ordered = sorted(paths, key=self._natural_sort_key)
+            ordered = self._filter_concat_folder_materials(sorted(paths, key=self._natural_sort_key))
             if len(ordered) >= 2 or (allow_single and len(ordered) == 1):
                 valid_groups.append((folder, ordered))
                 if len(ordered) == 1:
                     single_group_count += 1
         valid_groups.sort(key=lambda item: self._natural_sort_key(item[0]))
         if not valid_groups:
+            rule_hint = "当前可在“组合规则...”里放宽或调整筛选条件。"
             if allow_single:
-                QMessageBox.warning(self, "提示", "没有找到可自动整理的文件夹组，请先确认视频素材是否有效。")
+                QMessageBox.warning(self, "提示", f"没有找到可自动整理的文件夹组，请先确认视频素材是否有效。\n{rule_hint}")
             else:
-                QMessageBox.warning(self, "提示", "没有找到可自动拼接的文件夹组。每个文件夹里至少要有 2 个视频。")
+                QMessageBox.warning(self, "提示", f"没有找到可自动拼接的文件夹组。每个文件夹里至少要有 2 个视频。\n{rule_hint}")
             return
         max_materials = max(len(paths) for _, paths in valid_groups)
         self._ensure_concat_material_columns(max_materials)
@@ -16353,7 +17011,7 @@ class VideoConcatTab(QWidget):
             used_names.add(output_name)
             table.setItem(row, 0, QTableWidgetItem(output_name))
             for col, path in enumerate(paths, 1):
-                token = self._format_concat_material_label(
+                token = self._format_concat_group_token(
                     path,
                     path_to_index.get(os.path.normcase(os.path.abspath(path)), "")
                 )
@@ -16375,16 +17033,15 @@ class VideoConcatTab(QWidget):
             "basename": {},
             "stem": {},
             "full": {},
-            "path_to_index": {}
+            "path_to_index": {},
         }
         for idx, path in enumerate(videos, 1):
-            idx_text = str(idx)
-            norm_path = os.path.normcase(os.path.abspath(path))
-            refs["index"][idx_text] = path
+            refs["index"][str(idx)] = path
             base = os.path.basename(path).lower()
             stem = os.path.splitext(base)[0]
+            norm_path = os.path.normcase(os.path.abspath(path))
             refs["full"][norm_path] = path
-            refs["path_to_index"][norm_path] = idx_text
+            refs["path_to_index"][norm_path] = str(idx)
             refs["basename"].setdefault(base, []).append(path)
             refs["stem"].setdefault(stem, []).append(path)
         return refs
@@ -16393,12 +17050,10 @@ class VideoConcatTab(QWidget):
         raw = str(token or "").strip().strip('"').strip("'")
         if not raw:
             return None, "存在空素材项"
-        normalized = raw.replace("（", "(").replace("）", ")")
-        match = re.search(r"\((\d+)\)\s*$", normalized)
-        if match:
-            idx_text = match.group(1)
-            p = refs["index"].get(idx_text)
-            return (p, None) if p else (None, f"编号 {idx_text} 不存在")
+        display_name, display_index = self._extract_concat_token_index(raw)
+        if display_index:
+            p = refs["index"].get(display_index)
+            return (p, None) if p else (None, f"编号 {display_index} 不存在")
         if raw.isdigit():
             p = refs["index"].get(raw)
             return (p, None) if p else (None, f"编号 {raw} 不存在")
@@ -16460,7 +17115,7 @@ class VideoConcatTab(QWidget):
                 continue
             used_names.add(output_name)
             tasks.append({"output_name": output_name, "inputs": inputs})
-            preview_lines.append(f"{output_name} <= " + " + ".join([os.path.basename(p) for p in inputs]))
+            preview_lines.append(f"{output_name} <= " + " + ".join([self._format_concat_preview_name(p, refs) for p in inputs]))
         if not tasks and not errors:
             errors.append("表格里还没有填写有效的拼接组合规则")
         return tasks, preview_lines, errors
@@ -21522,6 +22177,15 @@ class FileManagerPro(QMainWindow):
             res_ext = os.path.splitext(str(m.get('res', '') or res_rel))[1]
             is_rename_preview = bool(rename_name) and not srt_abs and not txt_abs
             display_label = f"{rename_name}{res_ext}" if is_rename_preview and res_ext else (rename_name if is_rename_preview else (m.get('src_label', '') or rename_name))
+            dup_total = int(m.get("duplicate_total", 0) or 0)
+            dup_index = int(m.get("duplicate_index", 0) or 0)
+            dup_tag = f" [重复{dup_index}/{dup_total}]" if dup_total > 1 and dup_index > 0 else ""
+            if dup_tag:
+                display_label = f"{display_label}{dup_tag}"
+            tooltip = str(m.get('tooltip', '') or '').strip()
+            duplicate_note = str(m.get("duplicate_note", "") or "").strip()
+            if duplicate_note and duplicate_note not in tooltip:
+                tooltip = f"{duplicate_note}\n\n{tooltip}" if tooltip else duplicate_note
             self._append_universal_match_row(
                 display_label,
                 res_rel,
@@ -21529,7 +22193,7 @@ class FileManagerPro(QMainWindow):
                 src_abs="",
                 res_abs=m.get('res', ''),
                 rename_name=rename_name,
-                tooltip=m.get('tooltip', ''),
+                tooltip=tooltip,
                 srt_label=srt_rel,
                 srt_abs=srt_abs,
                 txt_label=txt_rel,

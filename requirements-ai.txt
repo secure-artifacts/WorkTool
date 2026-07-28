@@ -1,0 +1,14 @@
+# AI 增强依赖
+# 说明：
+# 1. 这份文件默认不包含 torch / torchaudio / torchvision
+# 2. 这三项请按机器情况单独安装，避免 CPU / CUDA 装错
+# 3. 先装完 requirements-base.txt，再装 torch 系列，最后再装本文件
+
+faster-whisper
+librosa
+transformers
+accelerate
+safetensors
+sentence-transformers
+qwen-vl-utils
+nvidia-ml-py
