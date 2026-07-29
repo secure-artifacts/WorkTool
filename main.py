@@ -2106,7 +2106,7 @@ class SubfolderSelectionDialog(QDialog):
             table = p.get("table")
             if not table or not is_alive(table): continue
             src_dir = p["source_input"].text().strip() if is_alive(p["source_input"]) else ""
-            out_dir = p["out_path"].text().strip() if is_alive(p["out_path"]) else ""
+            out_dir = self._get_heygen_base_output_dir(proj_name, p)
             for i in range(table.rowCount()):
                 code = table.item(i, 0).text().strip() if table.item(i, 0) else ""
                 if not code: continue
@@ -18043,7 +18043,7 @@ class NoteWidget(QFrame):
             table = p.get("table")
             if not table or not is_alive(table): continue
             src_dir = p["source_input"].text().strip() if is_alive(p["source_input"]) else ""
-            out_dir = p["out_path"].text().strip() if is_alive(p["out_path"]) else ""
+            out_dir = self._get_heygen_base_output_dir(proj_name, p)
             for i in range(table.rowCount()):
                 code = table.item(i, 0).text().strip() if table.item(i, 0) else ""
                 if not code: continue
@@ -19581,7 +19581,8 @@ class FileManagerPro(QMainWindow):
             if orig_path and os.path.isabs(orig_path) and os.path.isfile(orig_path): return orig_path
             p = self.project_tabs.get(proj_name, {})
             search_dirs = []
-            if is_alive(p.get("out_path")): search_dirs.append(p["out_path"].text().strip())
+            base_out_dir = self._get_heygen_base_output_dir(proj_name, p)
+            if base_out_dir: search_dirs.append(base_out_dir)
             if is_alive(p.get("source_input")): search_dirs.append(p["source_input"].text().strip())
             g_root = self.heygen_source_input.text().strip() if hasattr(self, "heygen_source_input") and is_alive(self.heygen_source_input) else ""
             if g_root: search_dirs.append(g_root)
@@ -20240,7 +20241,7 @@ class FileManagerPro(QMainWindow):
             table = p.get("table")
             if not table or not is_alive(table): continue
             src_dir = p["source_input"].text().strip() if is_alive(p["source_input"]) else ""
-            out_dir = p["out_path"].text().strip() if is_alive(p["out_path"]) else ""
+            out_dir = self._get_heygen_base_output_dir(proj_name, p)
             for i in range(table.rowCount()):
                 code = table.item(i, 0).text().strip() if table.item(i, 0) else ""
                 if not code: continue
@@ -20658,15 +20659,15 @@ class FileManagerPro(QMainWindow):
         path_layout.addWidget(QLabel("整理后存放位置:"))
         path_input = PathDropLineEdit(accept_dirs=True, accept_files=False)
         path_input.setText(out_path or "")
-        path_input.setPlaceholderText("可拖入目标文件夹；支持变量：{date} / {yyyyMMdd}")
-        path_input.setToolTip("支持变量：{date} / {yyyyMMdd} / {project}\n例如：D:\\output\\{date}")
+        path_input.setPlaceholderText("可留空；留空时自动使用上方“全局统一存放位置”")
+        path_input.setToolTip("可单独覆盖全局路径；支持变量：{date} / {yyyyMMdd} / {project}\n例如：D:\\output\\{date}")
         path_input.textChanged.connect(self.trigger_save)
         path_layout.addWidget(path_input)
         btn_browse = QPushButton("选择")
         btn_browse.clicked.connect(lambda: self.browse_dir(path_input))
         path_layout.addWidget(btn_browse)
         v_layout.addLayout(path_layout)
-        path_hint = QLabel("支持变量：`{date}`、`{yyyy-MM-dd}`、`{yyyyMMdd}`、`{project}`。示例：`D:\\输出\\{date}`")
+        path_hint = QLabel("可留空，留空时自动使用上方全局统一存放位置。若单独填写，则仅当前项目生效。支持变量：`{date}`、`{yyyy-MM-dd}`、`{yyyyMMdd}`、`{project}`。")
         path_hint.setWordWrap(True)
         path_hint.setStyleSheet("color:#64748b; padding:0 0 4px 2px;")
         v_layout.addWidget(path_hint)
@@ -20833,10 +20834,9 @@ class FileManagerPro(QMainWindow):
         base_dirs = []
         for name in list(self.project_tabs.keys()):
             p = self.project_tabs.get(name) or {}
-            base_out_dir_raw = p.get("out_path").text().strip() if p.get("out_path") else ""
-            base_out_dir = self._render_output_base_dir(base_out_dir_raw, project_name=name)
+            base_out_dir = self._get_heygen_base_output_dir(name, p)
             if not base_out_dir:
-                self.log(f"⚠️ 项目 [{name}] 未设置存放位置，跳过", "orange")
+                self.log(f"⚠️ 项目 [{name}] 未设置项目存放位置且全局统一存放位置也为空，已跳过", "orange")
                 continue
             if base_out_dir not in base_dirs:
                 base_dirs.append(base_out_dir)
@@ -20873,7 +20873,7 @@ class FileManagerPro(QMainWindow):
                 self.log(f"ℹ️ 项目 [{name}] 没有可导出的英文文案", "orange")
         if total_projects <= 0:
             if show_dialog:
-                QMessageBox.information(self, "完成", "没有任何项目导出了分段英文（可能都没有英文文案或未设置存放位置）。")
+                QMessageBox.information(self, "完成", "没有任何项目导出了分段英文（可能都没有英文文案，或项目/全局存放位置都未设置）。")
             return {"projects": 0, "groups": 0, "files": 0, "base_dirs": base_dirs}
         out_hint = base_dirs[0] if base_dirs else ""
         more_hint = f"\n（注意：检测到 {len(base_dirs)} 个不同的输出根目录）" if len(base_dirs) > 1 else ""
@@ -21886,7 +21886,7 @@ class FileManagerPro(QMainWindow):
                 # 获取项目当前的图片根目录，用于路径纠错
                 project_out_dir = ""
                 if p_name in self.project_tabs:
-                    base_out = self.project_tabs[p_name]["out_path"].text().strip()
+                    base_out = self._get_heygen_base_output_dir(p_name, self.project_tabs[p_name])
                     if base_out:
                         project_out_dir = os.path.join(base_out, clean_long_filename(p_name))
 
@@ -26118,6 +26118,20 @@ class FileManagerPro(QMainWindow):
         except Exception:
             return raw
 
+    def _get_heygen_base_output_dir(self, project_name="", project_entry=None):
+        """
+        获取素材整理模块的实际输出根目录：
+        1. 优先使用项目自己的“整理后存放位置”
+        2. 若项目未填写，则回退到“全局统一存放位置”
+        """
+        raw = ""
+        p = project_entry if isinstance(project_entry, dict) else None
+        if p and is_alive(p.get("out_path")):
+            raw = p["out_path"].text().strip()
+        if not raw and hasattr(self, "heygen_global_out_input") and is_alive(self.heygen_global_out_input):
+            raw = self.heygen_global_out_input.text().strip()
+        return self._render_output_base_dir(raw, project_name=project_name)
+
     def browse_file(self, line_edit, filter_str="所有文件 (*)"):
         start_dir = self._get_browse_start_dir(line_edit)
         path, _ = QFileDialog.getOpenFileName(self, "选择文件", start_dir, filter_str)
@@ -26153,10 +26167,10 @@ class FileManagerPro(QMainWindow):
     def run_single_heygen_csv_only(self, name):
         if name not in self.project_tabs: return
         p = self.project_tabs[name]
-        base_out_dir = self._render_output_base_dir(p["out_path"].text().strip(), project_name=name)
+        base_out_dir = self._get_heygen_base_output_dir(name, p)
         table = p["table"]
         if not base_out_dir:
-            QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置")
+            QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置，或填写上方全局统一存放位置")
             return
         
         out_dir = os.path.join(base_out_dir, clean_long_filename(name))
@@ -26195,10 +26209,10 @@ class FileManagerPro(QMainWindow):
         """
         if name not in self.project_tabs: return
         p = self.project_tabs[name]
-        base_out_dir = self._render_output_base_dir(p["out_path"].text().strip(), project_name=name)
+        base_out_dir = self._get_heygen_base_output_dir(name, p)
         table = p["table"]
         if not base_out_dir:
-            QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置")
+            QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置，或填写上方全局统一存放位置")
             return
         
         # 获取用户设置的基础上限
@@ -26244,11 +26258,11 @@ class FileManagerPro(QMainWindow):
     def run_single_heygen_project(self, name, write_csv=True):
         if name not in self.project_tabs: return []
         p = self.project_tabs[name]
-        base_out_dir = self._render_output_base_dir(p["out_path"].text().strip(), project_name=name)
+        base_out_dir = self._get_heygen_base_output_dir(name, p)
         table = p["table"]
         move_mode = p["move_check"].isChecked()
         if not base_out_dir:
-            QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置")
+            QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置，或填写上方全局统一存放位置")
             return []
         # 只有在确实有素材可处理时才创建文件夹
         out_dir = os.path.join(base_out_dir, clean_long_filename(name))
@@ -26322,7 +26336,7 @@ class FileManagerPro(QMainWindow):
         
         for name in list(self.project_tabs.keys()):
             if not first_base_out_dir and name in self.project_tabs:
-                first_base_out_dir = self._render_output_base_dir(self.project_tabs[name]["out_path"].text().strip(), project_name=name)
+                first_base_out_dir = self._get_heygen_base_output_dir(name, self.project_tabs[name])
             
             # 修改：调用 run_single_heygen_project 时 write_csv 设为 True
             # 这样每个项目会自动在自己的文件夹下生成一份独立的 CSV
@@ -28247,6 +28261,8 @@ class FileManagerPro(QMainWindow):
             if hasattr(self, "sorter_code_prefix_input") and is_alive(self.sorter_code_prefix_input):
                 self.sorter_code_prefix_input.setText(str(cfg.get("sorter_code_prefix", "") or ""))
             if hasattr(self, "auto_root_input") and self.auto_root_input: self.auto_root_input.setText(cfg.get("auto_root_path", ""))
+            if hasattr(self, "heygen_global_out_input") and self.heygen_global_out_input:
+                self.heygen_global_out_input.setText(cfg.get("heygen_global_out_path", ""))
             self.recursive_check.setChecked(cfg.get("recursive", False))
             if hasattr(self, "sorter_name_folder_check") and is_alive(self.sorter_name_folder_check):
                 self.sorter_name_folder_check.setChecked(bool(cfg.get("sorter_name_folder_enabled", True)))
@@ -28511,6 +28527,7 @@ class FileManagerPro(QMainWindow):
                 "sorter_path": self.sorter_path_input.text() if hasattr(self, "sorter_path_input") and is_alive(self.sorter_path_input) else "",
                 "sorter_code_prefix": self.sorter_code_prefix_input.text().strip() if hasattr(self, "sorter_code_prefix_input") and is_alive(self.sorter_code_prefix_input) else "",
                 "auto_root_path": self.auto_root_input.text() if hasattr(self, "auto_root_input") and is_alive(self.auto_root_input) else "",
+                "heygen_global_out_path": self.heygen_global_out_input.text() if hasattr(self, "heygen_global_out_input") and is_alive(self.heygen_global_out_input) else "",
                 "recursive": self.recursive_check.isChecked() if hasattr(self, "recursive_check") and is_alive(self.recursive_check) else False,
                 "sorter_mode": self._get_sorter_mode() if hasattr(self, "_get_sorter_mode") else "comprehensive",
                 "sorter_time_basis": self.sorter_time_basis_combo.currentData() if hasattr(self, "sorter_time_basis_combo") and is_alive(self.sorter_time_basis_combo) else "mtime",
@@ -29002,6 +29019,23 @@ class FileManagerPro(QMainWindow):
         btn_browse.clicked.connect(lambda: self.browse_dir(self.auto_root_input))
         path_row.addWidget(btn_browse)
         auto_layout.addLayout(path_row)
+
+        global_out_row = QHBoxLayout()
+        global_out_row.addWidget(QLabel("全局统一存放位置:"))
+        self.heygen_global_out_input = PathDropLineEdit(accept_dirs=True, accept_files=False)
+        self.heygen_global_out_input.setPlaceholderText("所有项目可共用这里；项目里留空时自动使用本路径")
+        self.heygen_global_out_input.setToolTip("支持变量：{date} / {yyyy-MM-dd} / {yyyyMMdd} / {project}\n例如：D:\\输出\\{date}")
+        self.heygen_global_out_input.textChanged.connect(self.trigger_save)
+        global_out_row.addWidget(self.heygen_global_out_input)
+        btn_browse_global_out = QPushButton("浏览")
+        btn_browse_global_out.clicked.connect(lambda: self.browse_dir(self.heygen_global_out_input))
+        global_out_row.addWidget(btn_browse_global_out)
+        auto_layout.addLayout(global_out_row)
+
+        global_out_hint = QLabel("说明：这里是所有项目共用的默认输出目录。项目自己的“整理后存放位置”如果留空，就自动走这里。支持变量：`{date}`、`{yyyy-MM-dd}`、`{yyyyMMdd}`、`{project}`。")
+        global_out_hint.setWordWrap(True)
+        global_out_hint.setStyleSheet("color:#64748b; padding:0 0 4px 2px;")
+        auto_layout.addWidget(global_out_hint)
         
         btn_row = QHBoxLayout()
         
