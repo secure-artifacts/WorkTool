@@ -1468,6 +1468,60 @@ class PathDropTextEdit(QTextEdit):
     def text(self): return self.toPlainText()
     def setText(self, t): self.setPlainText(t)
 
+class PathDropLineEdit(QLineEdit):
+    """支持把文件夹/文件拖入的单行输入框（用于路径）。"""
+    def __init__(self, parent=None, accept_dirs=True, accept_files=False):
+        super().__init__(parent)
+        self.accept_dirs = accept_dirs
+        self.accept_files = accept_files
+        self.setAcceptDrops(True)
+
+    def _extract_local_path(self, url):
+        path = ""
+        try:
+            path = url.toLocalFile()
+        except Exception:
+            path = ""
+        if not path:
+            raw = ""
+            try:
+                raw = url.toString()
+            except Exception:
+                raw = ""
+            if raw.startswith("file:///"):
+                path = urllib.parse.unquote(raw[8:])
+                if sys.platform == 'win32' and path.startswith('/'):
+                    path = path[1:]
+        return os.path.normpath(path) if path else ""
+
+    def _is_acceptable_path(self, path):
+        if not path:
+            return False
+        return (self.accept_dirs and os.path.isdir(path)) or (self.accept_files and os.path.isfile(path))
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if self._is_acceptable_path(self._extract_local_path(url)):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        for url in event.mimeData().urls():
+            path = self._extract_local_path(url)
+            if self._is_acceptable_path(path):
+                self.setText(path)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
 class ChatInputTextEdit(QTextEdit):
     """聊天输入框：支持拖入文件/文件夹作为附件。"""
     attachments_dropped = pyqtSignal(list)
@@ -20588,9 +20642,34 @@ class FileManagerPro(QMainWindow):
 
     def create_heygen_project_ui(self, name, out_path="", src_path="", table_data=None, split_limit_value=None):
         project_widget = QWidget(); v_layout = QVBoxLayout(project_widget); # 素材来源
-        src_layout = QHBoxLayout(); src_layout.addWidget(QLabel("素材来源目录:")); src_input = QLineEdit(src_path); src_input.textChanged.connect(self.trigger_save); src_layout.addWidget(src_input); btn_src = QPushButton("浏览"); btn_src.clicked.connect(lambda: self.browse_dir(src_input)); src_layout.addWidget(btn_src); v_layout.addLayout(src_layout)
+        src_layout = QHBoxLayout()
+        src_layout.addWidget(QLabel("素材来源目录:"))
+        src_input = PathDropLineEdit(accept_dirs=True, accept_files=False)
+        src_input.setText(src_path or "")
+        src_input.setPlaceholderText("可直接拖入素材来源文件夹")
+        src_input.textChanged.connect(self.trigger_save)
+        src_layout.addWidget(src_input)
+        btn_src = QPushButton("浏览")
+        btn_src.clicked.connect(lambda: self.browse_dir(src_input))
+        src_layout.addWidget(btn_src)
+        v_layout.addLayout(src_layout)
         # 整理后存放
-        path_layout = QHBoxLayout(); path_layout.addWidget(QLabel("整理后存放位置:")); path_input = QLineEdit(out_path); path_input.textChanged.connect(self.trigger_save); path_layout.addWidget(path_input); btn_browse = QPushButton("选择"); btn_browse.clicked.connect(lambda: self.browse_dir(path_input)); path_layout.addWidget(btn_browse); v_layout.addLayout(path_layout)
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(QLabel("整理后存放位置:"))
+        path_input = PathDropLineEdit(accept_dirs=True, accept_files=False)
+        path_input.setText(out_path or "")
+        path_input.setPlaceholderText("可拖入目标文件夹；支持变量：{date} / {yyyyMMdd}")
+        path_input.setToolTip("支持变量：{date} / {yyyyMMdd} / {project}\n例如：D:\\output\\{date}")
+        path_input.textChanged.connect(self.trigger_save)
+        path_layout.addWidget(path_input)
+        btn_browse = QPushButton("选择")
+        btn_browse.clicked.connect(lambda: self.browse_dir(path_input))
+        path_layout.addWidget(btn_browse)
+        v_layout.addLayout(path_layout)
+        path_hint = QLabel("支持变量：`{date}`、`{yyyy-MM-dd}`、`{yyyyMMdd}`、`{project}`。示例：`D:\\输出\\{date}`")
+        path_hint.setWordWrap(True)
+        path_hint.setStyleSheet("color:#64748b; padding:0 0 4px 2px;")
+        v_layout.addWidget(path_hint)
         # ── 顶部统计栏 ──
         count_layout = QHBoxLayout()
         count_label = QLabel("📊 已录入有效条数: 0")
@@ -20716,6 +20795,95 @@ class FileManagerPro(QMainWindow):
             self.log("已清空所有项目表格数据", "red")
             self.update_global_total_count()
             self.trigger_save()
+
+    def delete_all_heygen_projects(self):
+        """一键删除所有项目（移除项目 Tab + 清空项目配置）。"""
+        if not hasattr(self, "heygen_project_tabs"):
+            return
+        if (not self.project_tabs) and self.heygen_project_tabs.count() <= 0:
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            "确定要删除【所有项目】吗？\n将移除所有项目 Tab，并清空项目配置（路径/表格内容/参数）。\n此操作不可撤销！",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            for idx in reversed(range(self.heygen_project_tabs.count())):
+                self.heygen_project_tabs.removeTab(idx)
+        except Exception:
+            pass
+        self.project_tabs = {}
+        self.log("已删除所有项目", "red")
+        self.update_global_total_count()
+        self.trigger_save()
+
+    def run_all_heygen_split_en(self, show_dialog=True):
+        """一键导出所有项目的“分段英文”（按行建文件夹）。"""
+        if not self.project_tabs:
+            if show_dialog:
+                QMessageBox.information(self, "提示", "当前没有任何项目。")
+            return {"projects": 0, "groups": 0, "files": 0, "base_dirs": []}
+        total_projects = 0
+        total_groups = 0
+        total_files = 0
+        base_dirs = []
+        for name in list(self.project_tabs.keys()):
+            p = self.project_tabs.get(name) or {}
+            base_out_dir_raw = p.get("out_path").text().strip() if p.get("out_path") else ""
+            base_out_dir = self._render_output_base_dir(base_out_dir_raw, project_name=name)
+            if not base_out_dir:
+                self.log(f"⚠️ 项目 [{name}] 未设置存放位置，跳过", "orange")
+                continue
+            if base_out_dir not in base_dirs:
+                base_dirs.append(base_out_dir)
+            table = p.get("table")
+            if not table:
+                continue
+            limit = p.get("split_limit").value() if p.get("split_limit") else 100
+            out_dir = os.path.join(base_out_dir, clean_long_filename(name))
+            count = 0
+            file_count = 0
+            for i in range(table.rowCount()):
+                code = table.item(i, 0).text().strip() if table.item(i, 0) else ""
+                en = table.item(i, 4).text().strip() if table.item(i, 4) else ""
+                if not en:
+                    continue
+                safe_code = clean_long_filename(code, 120) if code else f"item_{i+1}"
+                item_dir = os.path.join(out_dir, safe_code)
+                os.makedirs(item_dir, exist_ok=True)
+                wrapped_text = smart_wrap_text(en, int(limit or 100), merge_single_linebreaks=True)
+                final_segments = [seg.strip() for seg in wrapped_text.splitlines() if seg and seg.strip()]
+                if not final_segments:
+                    final_segments = [en.strip()]
+                for idx, content in enumerate(final_segments, 1):
+                    with open(os.path.join(item_dir, f"{idx}.txt"), "w", encoding="utf-8") as f:
+                        f.write(content)
+                    file_count += 1
+                count += 1
+            if count > 0:
+                total_projects += 1
+                total_groups += count
+                total_files += file_count
+                self.log(f"✅ 项目 [{name}] 分段英文导出完成：{count} 组 / {file_count} 段", "green")
+            else:
+                self.log(f"ℹ️ 项目 [{name}] 没有可导出的英文文案", "orange")
+        if total_projects <= 0:
+            if show_dialog:
+                QMessageBox.information(self, "完成", "没有任何项目导出了分段英文（可能都没有英文文案或未设置存放位置）。")
+            return {"projects": 0, "groups": 0, "files": 0, "base_dirs": base_dirs}
+        out_hint = base_dirs[0] if base_dirs else ""
+        more_hint = f"\n（注意：检测到 {len(base_dirs)} 个不同的输出根目录）" if len(base_dirs) > 1 else ""
+        if show_dialog:
+            QMessageBox.information(
+                self,
+                "完成",
+                f"已完成分段英文批量导出！\n\n导出项目数：{total_projects}\n处理组数：{total_groups}\n总分段数：{total_files}\n输出根目录示例：{out_hint}{more_hint}"
+            )
+        return {"projects": total_projects, "groups": total_groups, "files": total_files, "base_dirs": base_dirs}
 
     # ─────────────────────────────────────────────
     #  smart_csv_import：智能 CSV 导入功能
@@ -25914,6 +26082,42 @@ class FileManagerPro(QMainWindow):
         """browse_folder 的别名，兼容代码中 browse_dir 的调用。"""
         self.browse_folder(line_edit)
 
+    def _render_output_base_dir(self, path_template, project_name=""):
+        """
+        渲染“整理后存放位置”的变量模板，并返回规范化后的实际路径。
+
+        支持变量：
+        - {date} / {yyyy-MM-dd}: 例如 2026-07-29
+        - {yyyyMMdd}: 例如 20260729
+        - {project}: 当前项目名（会做安全化）
+        """
+        raw = str(path_template or "").strip()
+        if not raw:
+            return ""
+        try:
+            from datetime import datetime as _dt
+            now = _dt.now()
+            mapping = {
+                "{date}": now.strftime("%Y-%m-%d"),
+                "{yyyy-MM-dd}": now.strftime("%Y-%m-%d"),
+                "{yyyyMMdd}": now.strftime("%Y%m%d"),
+                "{project}": clean_long_filename(str(project_name or ""), 120) if project_name else "",
+            }
+        except Exception:
+            mapping = {}
+        # 展开环境变量与 ~
+        try:
+            raw = os.path.expandvars(os.path.expanduser(raw))
+        except Exception:
+            pass
+        for k, v in mapping.items():
+            if k in raw:
+                raw = raw.replace(k, v)
+        try:
+            return os.path.normpath(raw)
+        except Exception:
+            return raw
+
     def browse_file(self, line_edit, filter_str="所有文件 (*)"):
         start_dir = self._get_browse_start_dir(line_edit)
         path, _ = QFileDialog.getOpenFileName(self, "选择文件", start_dir, filter_str)
@@ -25948,8 +26152,12 @@ class FileManagerPro(QMainWindow):
 
     def run_single_heygen_csv_only(self, name):
         if name not in self.project_tabs: return
-        p = self.project_tabs[name]; base_out_dir = p["out_path"].text().strip(); table = p["table"]
-        if not base_out_dir: QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置"); return
+        p = self.project_tabs[name]
+        base_out_dir = self._render_output_base_dir(p["out_path"].text().strip(), project_name=name)
+        table = p["table"]
+        if not base_out_dir:
+            QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置")
+            return
         
         out_dir = os.path.join(base_out_dir, clean_long_filename(name))
         if not os.path.exists(out_dir): os.makedirs(out_dir)
@@ -25986,8 +26194,12 @@ class FileManagerPro(QMainWindow):
         3. 若单句本身过长，再降级到逗号/单词边界切分。
         """
         if name not in self.project_tabs: return
-        p = self.project_tabs[name]; base_out_dir = p["out_path"].text().strip(); table = p["table"]
-        if not base_out_dir: QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置"); return
+        p = self.project_tabs[name]
+        base_out_dir = self._render_output_base_dir(p["out_path"].text().strip(), project_name=name)
+        table = p["table"]
+        if not base_out_dir:
+            QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置")
+            return
         
         # 获取用户设置的基础上限
         limit = p.get("split_limit").value() if p.get("split_limit") else 100
@@ -26031,8 +26243,13 @@ class FileManagerPro(QMainWindow):
 
     def run_single_heygen_project(self, name, write_csv=True):
         if name not in self.project_tabs: return []
-        p = self.project_tabs[name]; base_out_dir = p["out_path"].text().strip(); table = p["table"]; move_mode = p["move_check"].isChecked()
-        if not base_out_dir: QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置"); return []
+        p = self.project_tabs[name]
+        base_out_dir = self._render_output_base_dir(p["out_path"].text().strip(), project_name=name)
+        table = p["table"]
+        move_mode = p["move_check"].isChecked()
+        if not base_out_dir:
+            QMessageBox.warning(self, "提示", f"请设置项目 [{name}] 的存放位置")
+            return []
         # 只有在确实有素材可处理时才创建文件夹
         out_dir = os.path.join(base_out_dir, clean_long_filename(name))
         count = 0; history = []; csv_rows = []
@@ -26105,7 +26322,7 @@ class FileManagerPro(QMainWindow):
         
         for name in list(self.project_tabs.keys()):
             if not first_base_out_dir and name in self.project_tabs:
-                first_base_out_dir = self.project_tabs[name]["out_path"].text().strip()
+                first_base_out_dir = self._render_output_base_dir(self.project_tabs[name]["out_path"].text().strip(), project_name=name)
             
             # 修改：调用 run_single_heygen_project 时 write_csv 设为 True
             # 这样每个项目会自动在自己的文件夹下生成一份独立的 CSV
@@ -26114,6 +26331,10 @@ class FileManagerPro(QMainWindow):
                 project_data[name] = project_rows
 
         if project_data and first_base_out_dir:
+            try:
+                os.makedirs(first_base_out_dir, exist_ok=True)
+            except Exception:
+                pass
             # 1. 生成 Excel 分页汇总（包含中英文）
             xlsx_path = make_unique_path(first_base_out_dir, "全部项目汇总_中英对照", ".xlsx", max_component_len=120, max_full_path=240)
             # 2. 生成 CSV 总汇总（包含中英文）
@@ -26138,7 +26359,27 @@ class FileManagerPro(QMainWindow):
                 self.last_heygen_history.append({"type": "file", "path": xlsx_path})
                 self.last_heygen_history.append({"type": "file", "path": csv_all_path})
                 self.log(f"✅ 全部项目汇总(Excel/CSV)已生成", "green")
-                QMessageBox.information(self, "完成", f"已成功整理全部项目！\n\n1. 汇总表（中英对照）：{xlsx_path}\n2. 独立分项 CSV（仅英无标）：已存入各项目文件夹")
+                split_stats = None
+                auto_split_enabled = hasattr(self, "heygen_auto_split_en_check") and self.heygen_auto_split_en_check.isChecked()
+                if auto_split_enabled:
+                    self.log("✂️ 已启用“整理后自动导出分段英文”，开始批量导出...", "blue")
+                    split_stats = self.run_all_heygen_split_en(show_dialog=False)
+                msg = (
+                    f"已成功整理全部项目！\n\n"
+                    f"1. 汇总表（中英对照）：{xlsx_path}\n"
+                    f"2. 独立分项 CSV（仅英无标）：已存入各项目文件夹"
+                )
+                if auto_split_enabled:
+                    if split_stats and split_stats.get("projects", 0) > 0:
+                        msg += (
+                            f"\n3. 已自动导出分段英文："
+                            f"{split_stats.get('projects', 0)} 个项目，"
+                            f"{split_stats.get('groups', 0)} 组，"
+                            f"{split_stats.get('files', 0)} 个分段文件"
+                        )
+                    else:
+                        msg += "\n3. 已尝试自动导出分段英文，但本次没有可导出的英文文案"
+                QMessageBox.information(self, "完成", msg)
             except Exception as e:
                 self.log(f"❌ 汇总表生成失败: {e}", "red")
                 # 如果 Excel 写入失败，降级到原有的 CSV 逻辑（可选）
@@ -28042,6 +28283,8 @@ class FileManagerPro(QMainWindow):
                 self.sorter_flatten_delete_empty_check.setChecked(bool(cfg.get("sorter_flatten_delete_empty", True)))
             if hasattr(self, "_on_sorter_mode_changed"):
                 self._on_sorter_mode_changed()
+            if hasattr(self, "heygen_auto_split_en_check") and is_alive(self.heygen_auto_split_en_check):
+                self.heygen_auto_split_en_check.setChecked(bool(cfg.get("heygen_auto_split_en_after_sort", False)))
             creator_cfg = cfg.get("creator_config", {})
             if isinstance(creator_cfg, dict):
                 if hasattr(self, "creator_path_input") and is_alive(self.creator_path_input):
@@ -28263,6 +28506,7 @@ class FileManagerPro(QMainWindow):
                 "heygen_projects": self._get_heygen_save_data(),
                 "heygen_projects_order": [self.heygen_project_tabs.tabText(i) for i in range(self.heygen_project_tabs.count())],
                 "heygen_default_split_limit": int(getattr(self, "_last_heygen_split_limit", 100) or 100),
+                "heygen_auto_split_en_after_sort": self.heygen_auto_split_en_check.isChecked() if hasattr(self, "heygen_auto_split_en_check") and is_alive(self.heygen_auto_split_en_check) else False,
                 "last_browse_dir": str(getattr(self, "_last_browse_dir", "") or ""),
                 "sorter_path": self.sorter_path_input.text() if hasattr(self, "sorter_path_input") and is_alive(self.sorter_path_input) else "",
                 "sorter_code_prefix": self.sorter_code_prefix_input.text().strip() if hasattr(self, "sorter_code_prefix_input") and is_alive(self.sorter_code_prefix_input) else "",
@@ -28750,8 +28994,8 @@ class FileManagerPro(QMainWindow):
         
         path_row = QHBoxLayout()
         path_row.addWidget(QLabel("监控总素材根目录 (A):"))
-        self.auto_root_input = QLineEdit()
-        self.auto_root_input.setPlaceholderText("选择包含 A1, A2... 子文件夹的总目录")
+        self.auto_root_input = PathDropLineEdit(accept_dirs=True, accept_files=False)
+        self.auto_root_input.setPlaceholderText("可直接拖入总目录（包含 A1, A2... 子文件夹）")
         self.auto_root_input.textChanged.connect(self.trigger_save)
         path_row.addWidget(self.auto_root_input)
         btn_browse = QPushButton("浏览")
@@ -28804,6 +29048,18 @@ class FileManagerPro(QMainWindow):
         self.btn_run_all_sort.clicked.connect(self.run_all_heygen_projects)
         btn_row.addWidget(self.btn_run_all_sort)
 
+        self.heygen_auto_split_en_check = QCheckBox("整理后自动导出分段英文")
+        self.heygen_auto_split_en_check.setToolTip("勾选后，点击“一键整理全部项目”时会自动继续执行“批量导出分段英文”")
+        self.heygen_auto_split_en_check.setChecked(False)
+        self.heygen_auto_split_en_check.toggled.connect(self.trigger_save)
+        btn_row.addWidget(self.heygen_auto_split_en_check)
+
+        self.btn_run_all_split_en = QPushButton("✂️ 一键导出分段英文")
+        self.btn_run_all_split_en.setToolTip("批量执行：对所有项目导出“分段英文”（按行建文件夹）")
+        self.btn_run_all_split_en.setStyleSheet("background-color: #0ea5e9; color: white; font-weight: bold; height: 35px;")
+        self.btn_run_all_split_en.clicked.connect(self.run_all_heygen_split_en)
+        btn_row.addWidget(self.btn_run_all_split_en)
+
         self.btn_global_csv_import = QPushButton("📥 全局智能CSV导入")
         self.btn_global_csv_import.setToolTip("从一个汇总CSV中识别所有项目的数据，并自动分发到对应的项目Tab中")
         self.btn_global_csv_import.setStyleSheet("background-color: #0891b2; color: white; font-weight: bold; height: 35px;")
@@ -28833,6 +29089,12 @@ class FileManagerPro(QMainWindow):
         btn_clear_all.setStyleSheet("background-color: #991b1b; color: white; font-weight: bold;")
         btn_clear_all.clicked.connect(self.clear_all_heygen_projects_data)
         manage_layout.addWidget(btn_clear_all)
+
+        btn_delete_all = QPushButton("🗑️ 一键删除所有项目")
+        btn_delete_all.setToolTip("删除所有项目 Tab，并清空项目配置（不可撤销）")
+        btn_delete_all.setStyleSheet("background-color: #7f1d1d; color: white; font-weight: bold;")
+        btn_delete_all.clicked.connect(self.delete_all_heygen_projects)
+        manage_layout.addWidget(btn_delete_all)
         
         layout.addLayout(manage_layout)
         
