@@ -828,7 +828,7 @@ try:
         QButtonGroup, QInputDialog, QSizePolicy, QListWidget, QListWidgetItem,
         QStackedWidget, QToolButton, QColorDialog, QFontComboBox, QDoubleSpinBox
     )
-    from PyQt6.QtCore import pyqtSlot, QMetaObject, Q_ARG, Qt, QSize, QThread, pyqtSignal, QPoint, QTimer, QMimeData, QUrl, QRect, QRectF, QEvent, QEventLoop, QObject
+    from PyQt6.QtCore import pyqtSlot, QMetaObject, Q_ARG, Qt, QSize, QThread, pyqtSignal, QPoint, QTimer, QMimeData, QUrl, QRect, QRectF, QEvent, QEventLoop, QObject, QItemSelectionModel
     from PyQt6.QtGui import (
         QTextCharFormat, QFont, QColor, QTextCursor, QPixmap, QImage,
         QPainter, QPen, QBrush, QTextTableFormat, QTextLength, QIcon, QDrag, QFontDatabase, QFontMetrics, QCursor, QDesktopServices, QPainterPath, QTransform
@@ -885,7 +885,7 @@ except ImportError:
         QButtonGroup, QInputDialog, QSizePolicy, QListWidget, QListWidgetItem,
         QStackedWidget, QToolButton, QColorDialog, QFontComboBox, QDoubleSpinBox
     )
-    from PyQt5.QtCore import pyqtSlot, QMetaObject, Q_ARG, Qt, QSize, QThread, pyqtSignal, QPoint, QTimer, QMimeData, QUrl, QRect, QRectF, QEvent, QEventLoop, QObject
+    from PyQt5.QtCore import pyqtSlot, QMetaObject, Q_ARG, Qt, QSize, QThread, pyqtSignal, QPoint, QTimer, QMimeData, QUrl, QRect, QRectF, QEvent, QEventLoop, QObject, QItemSelectionModel
     from PyQt5.QtGui import (
         QTextCharFormat, QFont, QColor, QTextCursor, QPixmap, QImage,
         QPainter, QPen, QBrush, QTextTableFormat, QTextLength, QIcon, QDrag, QFontDatabase, QFontMetrics, QCursor, QDesktopServices, QPainterPath, QTransform
@@ -1760,11 +1760,13 @@ class SubfolderSelectionDialog(QDialog):
         t_bar.addWidget(btn_batch_win)
         l_tasks.addLayout(t_bar)
 
-        self.auto_task_table = QTableWidget(0, 6)
+        self.auto_task_table = ExcelTable(0, 6)
+        self.auto_task_table.setObjectName("auto_task_table")
+        self.auto_task_table._smart_fill_enabled_columns = {1, 2, 3, 4, 5}
         self.auto_task_table.setHorizontalHeaderLabels(["执行", "项目代码", "目标窗口 (留空用全局)", "图片路径", "文案内容", "状态"])
         self.auto_task_table.horizontalHeader().setStretchLastSection(True)
         self.auto_task_table.setAlternatingRowColors(False)
-        self.auto_task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows if PYQT_VERSION == 6 else QAbstractItemView.SelectRows)
+        self.auto_task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems if PYQT_VERSION == 6 else QAbstractItemView.SelectItems)
         self.auto_task_table.setColumnWidth(0, 56)
         self.auto_task_table.setColumnWidth(1, 190)
         self.auto_task_table.setColumnWidth(2, 210)
@@ -3856,25 +3858,24 @@ class ExcelTable(QTableWidget):
             if selected_ranges:
                 last_range = selected_ranges[-1]
                 last_row, last_col = last_range.bottomRow(), last_range.rightColumn()
-                item = self.item(last_row, last_col)
-                if item:
-                    rect = self.visualItemRect(item)
-                    handle_size = 14
-                    if QRect(rect.right() - handle_size, rect.bottom() - handle_size, handle_size, handle_size).contains(pos):
-                        self._is_filling = True
-                        self._fill_source_info = (last_range.topRow(), last_range.bottomRow(), last_col)
-                        self._last_fill_row = last_row
-                        self.setCursor(Qt.CursorShape.CrossCursor); self.clearFocus()
-                        event.accept(); return
-            # 判定单个单元格右下角
-            item = self.itemAt(pos)
-            if item:
-                rect = self.visualItemRect(item)
+                rect = self.visualRect(self.model().index(last_row, last_col))
                 handle_size = 14
-                if QRect(rect.right() - handle_size, rect.bottom() - handle_size, handle_size, handle_size).contains(pos):
+                if rect.isValid() and self._can_fill_column(last_col) and QRect(rect.right() - handle_size, rect.bottom() - handle_size, handle_size, handle_size).contains(pos):
                     self._is_filling = True
-                    self._fill_source_info = (item.row(), item.row(), item.column())
-                    self._last_fill_row = item.row()
+                    self._fill_source_info = (last_range.topRow(), last_range.bottomRow(), last_col)
+                    self._last_fill_row = last_row
+                    self.setCursor(Qt.CursorShape.CrossCursor); self.clearFocus()
+                    event.accept(); return
+            # 判定单个单元格右下角
+            index = self.indexAt(pos)
+            if index.isValid():
+                row, col = index.row(), index.column()
+                rect = self.visualRect(index)
+                handle_size = 14
+                if self._can_fill_column(col) and QRect(rect.right() - handle_size, rect.bottom() - handle_size, handle_size, handle_size).contains(pos):
+                    self._is_filling = True
+                    self._fill_source_info = (row, row, col)
+                    self._last_fill_row = row
                     self.setCursor(Qt.CursorShape.CrossCursor); self.clearFocus()
                     event.accept(); return
         super().mousePressEvent(event)
@@ -3895,21 +3896,23 @@ class ExcelTable(QTableWidget):
                     self._fill_direction = "V"
                     r_start, r_end = min(top, curr_row), max(bottom, curr_row)
                     for r in range(r_start, r_end + 1):
-                        it = self.item(r, src_col)
-                        if it: it.setSelected(True)
+                        idx = self.model().index(r, src_col)
+                        if idx.isValid():
+                            self.selectionModel().select(idx, QItemSelectionModel.SelectionFlag.Select if PYQT_VERSION == 6 else QItemSelectionModel.Select)
                 else:
                     self._fill_direction = "H"
                     c_start, c_end = min(src_col, curr_col), max(src_col, curr_col)
                     for c in range(c_start, c_end + 1):
                         for r in range(top, bottom + 1):
-                            it = self.item(r, c)
-                            if it: it.setSelected(True)
+                            idx = self.model().index(r, c)
+                            if idx.isValid():
+                                self.selectionModel().select(idx, QItemSelectionModel.SelectionFlag.Select if PYQT_VERSION == 6 else QItemSelectionModel.Select)
             event.accept(); return
-        item = self.itemAt(pos)
-        if item:
-            rect = self.visualItemRect(item)
+        index = self.indexAt(pos)
+        if index.isValid():
+            rect = self.visualRect(index)
             handle_size = 14
-            if QRect(rect.right() - handle_size, rect.bottom() - handle_size, handle_size, handle_size).contains(pos):
+            if self._can_fill_column(index.column()) and QRect(rect.right() - handle_size, rect.bottom() - handle_size, handle_size, handle_size).contains(pos):
                 self.setCursor(Qt.CursorShape.CrossCursor)
             else: self.setCursor(Qt.CursorShape.ArrowCursor)
         else: self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -3929,62 +3932,408 @@ class ExcelTable(QTableWidget):
             self.clearSelection(); event.accept(); return
         super().mouseReleaseEvent(event)
 
+    def _can_fill_column(self, col):
+        enabled = getattr(self, "_smart_fill_enabled_columns", None)
+        if enabled is None:
+            return 0 <= col < self.columnCount()
+        try:
+            return col in set(enabled)
+        except Exception:
+            return False
+
+    def _get_fill_cell_payload(self, row, col):
+        widget = self.cellWidget(row, col)
+        if widget and isinstance(widget, QComboBox):
+            txt = widget.currentText()
+            return {"text": txt, "norm_text": str(txt or "").strip(), "formula": None, "kind": "combo"}
+        if widget and isinstance(widget, QCheckBox):
+            txt = "YES" if widget.isChecked() else "NO"
+            return {"text": txt, "norm_text": txt, "formula": None, "kind": "check_widget"}
+
+        item = self.item(row, col)
+        if not item:
+            return {"text": "", "norm_text": "", "formula": None, "kind": "empty"}
+
+        meta = item.data(_UserRole)
+        if isinstance(meta, dict) and "base_code" in meta:
+            txt = str(meta.get("base_code", "") or "")
+        else:
+            txt = item.text()
+        return {
+            "text": txt,
+            "norm_text": str(txt or "").strip(),
+            "formula": item.data(_UserRole + 11),
+            "kind": "item",
+        }
+
+    def _set_fill_cell_payload(self, row, col, value, formula=None):
+        if row >= self.rowCount():
+            self.setRowCount(row + 1)
+        if col >= self.columnCount():
+            self.setColumnCount(col + 1)
+
+        widget = self.cellWidget(row, col)
+        if widget and isinstance(widget, QComboBox):
+            widget.setCurrentText("" if value is None else str(value))
+            return
+        if widget and isinstance(widget, QCheckBox):
+            raw = str(value or "").strip().lower()
+            widget.setChecked(raw in ("1", "true", "yes", "y", "on", "done"))
+            return
+
+        item = self.item(row, col)
+        if not item:
+            item = QTableWidgetItem()
+            self.setItem(row, col, item)
+
+        meta = item.data(_UserRole)
+        if isinstance(meta, dict) and "base_code" in meta:
+            base_code = str(value or "").replace("(续)", "").strip()
+            is_sub = bool(meta.get("is_sub"))
+            current_text = item.text() or ""
+            if is_sub:
+                display_text = f"│    ↳ {base_code}{' (续)' if base_code and not base_code.endswith('(续)') else ''}"
+            else:
+                is_expanded = current_text.lstrip().startswith("▾")
+                display_text = f"{'▾ ★' if is_expanded else '▸ ★'} {base_code}".strip()
+            meta["base_code"] = base_code
+            item.setData(_UserRole, meta)
+            item.setText(display_text)
+            return
+
+        item.setText("" if value is None else str(value))
+        if formula is not None:
+            item.setData(_UserRole + 11, formula)
+        else:
+            item.setData(_UserRole + 11, None)
+
+    def _build_series_plan(self, source_data):
+        if not source_data:
+            return {"kind": "empty"}
+
+        texts = [d.get("text", "") for d in source_data]
+        norm_texts = [d.get("norm_text", "") for d in source_data]
+        formulas = [d.get("formula") for d in source_data]
+
+        if len(source_data) == 1 and formulas[0]:
+            return {"kind": "formula", "formula": formulas[0]}
+
+        nums = []
+        is_num = True
+        for txt in norm_texts:
+            try:
+                nums.append(float(txt))
+            except Exception:
+                is_num = False
+                break
+        if is_num and nums:
+            step = 1
+            if len(nums) >= 2:
+                step = nums[-1] - nums[-2]
+                if step == 0:
+                    return {"kind": "copy_cycle", "texts": texts}
+            return {"kind": "number", "nums": nums, "step": step}
+
+        if all(norm_texts) and all(not f for f in formulas):
+            date_series = self._analyze_date_series(norm_texts)
+            if date_series:
+                return {"kind": "date", "series": date_series}
+            text_series = self._analyze_text_series(norm_texts)
+            if text_series:
+                return {"kind": "text_series", "series": text_series}
+
+        return {"kind": "copy_cycle", "texts": texts}
+
+    def _materialize_series_value(self, plan, fill_forward, offset):
+        kind = plan.get("kind")
+        if kind == "formula":
+            return {"value": plan.get("formula"), "formula": plan.get("formula")}
+        if kind == "number":
+            nums = plan.get("nums", [])
+            if not nums:
+                return {"value": ""}
+            step = float(plan.get("step", 1))
+            base = nums[-1] if fill_forward else nums[0]
+            new_val = base + step * offset
+            return {"value": str(int(new_val)) if float(new_val).is_integer() else str(round(new_val, 4))}
+        if kind == "date":
+            series = plan.get("series", {})
+            dates = series.get("dates", [])
+            if not dates:
+                return {"value": ""}
+            base_dt = dates[-1] if fill_forward else dates[0]
+            new_dt = base_dt + series["step_delta"] * int(offset)
+            return {"value": self._format_date_by_style(new_dt, series.get("style"))}
+        if kind == "text_series":
+            series = plan.get("series", {})
+            nums_list = series.get("nums_list", [])
+            if not nums_list:
+                return {"value": ""}
+            base_nums = nums_list[-1] if fill_forward else nums_list[0]
+            new_nums = []
+            for i, base in enumerate(base_nums):
+                step_i = int(series["steps"][i])
+                new_nums.append(int(base + step_i * offset))
+            out = []
+            for i in range(len(series["steps"])):
+                out.append(series["literals"][i])
+                out.append(str(new_nums[i]).zfill(int(series["pads"][i])))
+            out.append(series["literals"][-1])
+            return {"value": "".join(out)}
+        if kind == "copy_cycle":
+            texts = plan.get("texts", [])
+            if not texts:
+                return {"value": ""}
+            idx = offset - 1 if fill_forward else abs(offset) - 1
+            return {"value": texts[idx % len(texts)]}
+        return {"value": ""}
+
     def auto_fill_v(self, source_info, end_row):
         top, bottom, col = source_info
-        if end_row == bottom: return
+        # 只支持向下/向上扩展填充；若拖拽仍落在源区间内则不处理
+        if end_row >= top and end_row <= bottom:
+            return
         self.blockSignals(True)
         try:
-            source_data = []
-            for r in range(top, bottom + 1):
-                it = self.item(r, col); txt = it.text().strip() if it else ""
-                source_data.append({'text': txt, 'formula': it.data(_UserRole + 11) if it else None})
-            if not source_data: return
-            nums = []; is_num = True
-            for d in source_data:
-                try: nums.append(float(d['text']))
-                except: is_num = False; break
-            step = 1 if end_row > bottom else -1
-            for r in range(bottom + step, end_row + step, step):
-                target = self.item(r, col)
-                if not target: target = QTableWidgetItem(); self.setItem(r, col, target)
-                if len(source_data) == 1:
-                    src = source_data[0]
-                    if src['formula']:
-                        new_f = self._adjust_formula(src['formula'], r - top, 0)
-                        target.setText(new_f); target.setData(_UserRole + 11, new_f)
-                    else: target.setText(src['text'])
-                elif is_num:
-                    diff = nums[-1] - nums[-2]; new_val = nums[-1] + diff * abs(r - bottom)
-                    target.setText(str(int(new_val)) if new_val.is_integer() else str(round(new_val, 4)))
+            source_data = [self._get_fill_cell_payload(r, col) for r in range(top, bottom + 1)]
+            if not source_data:
+                return
+            plan = self._build_series_plan(source_data)
+
+            fill_down = end_row > bottom
+            if fill_down:
+                row_iter = range(bottom + 1, end_row + 1)
+            else:
+                # 向上填充：从 top-1 开始，避免覆盖源数据
+                row_iter = range(top - 1, end_row - 1, -1)
+
+            for r in row_iter:
+                offset = (r - bottom) if fill_down else (r - top)
+                value_pack = self._materialize_series_value(plan, fill_down, offset)
+                if plan.get("kind") == "formula":
+                    new_f = self._adjust_formula(value_pack.get("formula", ""), r - top, 0)
+                    self._set_fill_cell_payload(r, col, new_f, formula=new_f)
                 else:
-                    src = source_data[(r - top) % len(source_data)]
-                    target.setText(src['text'])
+                    self._set_fill_cell_payload(r, col, value_pack.get("value", ""))
         finally: self.blockSignals(False)
         self.recalculate_all(); self.trigger_main_save()
+
+    def _analyze_date_series(self, texts):
+        """
+        识别常见日期格式，并按谷歌表格的感觉做“按天递增”填充：
+        - 2 个种子：按两者日期差（天）作为步长
+        - 1 个种子：默认步长为 1 天
+        - 若多个种子但步长为 0（日期完全相同），认为不是序列，返回 None（交给循环填充）
+
+        支持格式（以第一个种子的样式为准）：
+        - YYYY-MM-DD / YYYY-M-D
+        - YYYY/MM/DD
+        - YYYY.MM.DD
+        - YYYY年M月D日
+        - YYYYMMDD
+        """
+        try:
+            from datetime import date as _date
+            from datetime import timedelta as _timedelta
+
+            texts = [str(t or "").strip() for t in (texts or [])]
+            if not texts or not texts[0]:
+                return None
+
+            style = self._detect_date_style(texts[0])
+            if not style:
+                return None
+
+            dates = []
+            for t in texts:
+                dt = self._parse_date_by_style(t, style)
+                if not dt:
+                    return None
+                dates.append(dt)
+
+            if len(dates) >= 2:
+                step_days = (dates[-1] - dates[-2]).days
+                if step_days == 0:
+                    return None
+            else:
+                step_days = 1
+
+            return {"dates": dates, "step_delta": _timedelta(days=int(step_days)), "style": style}
+        except Exception:
+            return None
+
+    def _detect_date_style(self, text):
+        """从单个文本中识别日期样式并记录 0 填充宽度等信息。"""
+        try:
+            t = str(text or "").strip()
+            # YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
+            m = re.match(r"^(\d{4})([-/.])(\d{1,2})\2(\d{1,2})$", t)
+            if m:
+                y, sep, mm, dd = m.groups()
+                return {"kind": "ymd_sep", "sep": sep, "y_pad": 4, "m_pad": len(mm), "d_pad": len(dd)}
+            # YYYY年M月D日
+            m = re.match(r"^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日$", t)
+            if m:
+                y, mm, dd = m.groups()
+                return {"kind": "ymd_cn", "y_pad": 4, "m_pad": len(mm), "d_pad": len(dd)}
+            # YYYYMMDD
+            m = re.match(r"^(\d{4})(\d{2})(\d{2})$", t)
+            if m:
+                return {"kind": "ymd_compact", "y_pad": 4, "m_pad": 2, "d_pad": 2}
+            return None
+        except Exception:
+            return None
+
+    def _parse_date_by_style(self, text, style):
+        """按指定 style 解析日期；失败返回 None。"""
+        try:
+            from datetime import date as _date
+
+            t = str(text or "").strip()
+            kind = (style or {}).get("kind")
+            if kind == "ymd_sep":
+                sep = re.escape(style.get("sep", "-"))
+                m = re.match(rf"^(\d{{4}}){sep}(\d{{1,2}}){sep}(\d{{1,2}})$", t)
+                if not m:
+                    return None
+                y, mm, dd = m.groups()
+                return _date(int(y), int(mm), int(dd))
+            if kind == "ymd_cn":
+                m = re.match(r"^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日$", t)
+                if not m:
+                    return None
+                y, mm, dd = m.groups()
+                return _date(int(y), int(mm), int(dd))
+            if kind == "ymd_compact":
+                m = re.match(r"^(\d{4})(\d{2})(\d{2})$", t)
+                if not m:
+                    return None
+                y, mm, dd = m.groups()
+                return _date(int(y), int(mm), int(dd))
+            return None
+        except Exception:
+            return None
+
+    def _format_date_by_style(self, dt, style):
+        """按 seed 的样式格式化日期字符串。"""
+        try:
+            if not dt or not style:
+                return ""
+            y = str(int(dt.year)).zfill(int(style.get("y_pad", 4)))
+            m = str(int(dt.month)).zfill(int(style.get("m_pad", 2)))
+            d = str(int(dt.day)).zfill(int(style.get("d_pad", 2)))
+            kind = style.get("kind")
+            if kind == "ymd_sep":
+                sep = style.get("sep", "-")
+                return f"{y}{sep}{m}{sep}{d}"
+            if kind == "ymd_cn":
+                return f"{y}年{m}月{d}日"
+            if kind == "ymd_compact":
+                return f"{y}{m}{d}"
+            return f"{y}-{m}-{d}"
+        except Exception:
+            try:
+                return str(dt)
+            except Exception:
+                return ""
+
+    def _analyze_text_series(self, texts):
+        """
+        尽量模拟「谷歌表格」的文本序列填充：
+        - 若内容可被抽象为「固定文本片段 + 一个或多个数字片段」的模板，则对发生变化的数字片段做等差递增；
+        - 仅 1 个种子时：默认递增最后一个数字片段（步长 1）；
+        - 若多个种子但数字片段均不变化（步长全为 0），则认为不是序列，返回 None（继续走循环填充逻辑）。
+
+        示例：
+        - 表格1, 表格2 => 表格3（递增数字片段）
+        - S01E01, S01E02 => S01E03（递增最后一个数字片段）
+        - Table_009 => Table_010（保留 0 填充宽度）
+        """
+        try:
+            texts = [str(t or "").strip() for t in (texts or [])]
+            if not texts or not texts[0]:
+                return None
+
+            first = texts[0]
+            # 用第一个文本生成「固定片段 + 数字段」的模板
+            split = re.split(r"(\d+)", first)
+            if len(split) < 3:
+                return None
+
+            literals = split[0::2]
+            pads = [len(s) for s in split[1::2]]
+            group_count = len(pads)
+            if group_count <= 0:
+                return None
+
+            # 生成匹配 pattern：^lit0(\d+)lit1(\d+)lit2...$
+            pattern = "^" + "".join(
+                re.escape(literals[i]) + (r"(\d+)" + re.escape(literals[i + 1]) if i < group_count else "")
+                for i in range(group_count)
+            ) + "$"
+            rx = re.compile(pattern)
+
+            nums_list = []
+            for t in texts:
+                m = rx.match(t)
+                if not m:
+                    return None
+                nums_list.append([int(x) for x in m.groups()])
+
+            # 推断每个数字片段的步长（取最后两个种子的差值）
+            if len(nums_list) >= 2:
+                steps = [nums_list[-1][i] - nums_list[-2][i] for i in range(group_count)]
+                # 若所有步长都为 0，则说明不是递增序列（例如“表格1/表格1”），交给循环填充逻辑
+                if all(s == 0 for s in steps):
+                    return None
+            else:
+                # 只有 1 个种子：默认递增最后一个数字片段
+                steps = [0] * group_count
+                steps[-1] = 1
+
+            return {"literals": literals, "pads": pads, "nums_list": nums_list, "steps": steps}
+        except Exception:
+            return None
 
     def auto_fill_h(self, source_info, end_col):
         top, bottom, src_col = source_info
         if end_col == src_col: return
         self.blockSignals(True)
         try:
+            source_data = [self._get_fill_cell_payload(r, src_col) for r in range(top, bottom + 1)]
+            if not source_data:
+                return
+            plan = self._build_series_plan(source_data) if len(source_data) > 1 else None
             step = 1 if end_col > src_col else -1
             for c in range(src_col + step, end_col + step, step):
                 for r in range(top, bottom + 1):
-                    source_item = self.item(r, src_col)
-                    if not source_item: continue
-                    target = self.item(r, c)
-                    if not target: target = QTableWidgetItem(); self.setItem(r, c, target)
-                    formula = source_item.data(_UserRole + 11)
-                    if formula:
-                        new_f = self._adjust_formula(formula, 0, c - src_col)
-                        target.setText(new_f); target.setData(_UserRole + 11, new_f)
-                    else: target.setText(source_item.text())
+                    source_payload = self._get_fill_cell_payload(r, src_col)
+                    if source_payload.get("formula"):
+                        new_f = self._adjust_formula(source_payload.get("formula"), 0, c - src_col)
+                        self._set_fill_cell_payload(r, c, new_f, formula=new_f)
+                        continue
+
+                    row_plan = self._build_series_plan([source_payload])
+                    if plan and top != bottom:
+                        row_plan = self._build_series_plan([self._get_fill_cell_payload(r, src_col)])
+                    offset = c - src_col
+                    fill_forward = end_col > src_col
+                    value_pack = self._materialize_series_value(row_plan, fill_forward, offset)
+                    self._set_fill_cell_payload(r, c, value_pack.get("value", ""))
         finally: self.blockSignals(False)
         self.recalculate_all(); self.trigger_main_save()
 
     def trigger_main_save(self):
         main_win = self.window()
         if hasattr(main_win, "trigger_save"): main_win.trigger_save()
+
+    def recalculate_all(self):
+        """
+        基类兜底：普通 ExcelTable 不一定支持公式系统。
+        这里保持为安全空操作，避免拖拽填充后因调用不存在的方法而崩溃。
+        真正支持公式重算的表格由子类 DraggableTableWidget 覆盖此方法。
+        """
+        return
 
     def _adjust_formula(self, formula, row_offset, col_offset):
         def replace_match(match):
@@ -17697,11 +18046,13 @@ class NoteWidget(QFrame):
         t_bar.addWidget(btn_batch_win)
         l_tasks.addLayout(t_bar)
 
-        self.auto_task_table = QTableWidget(0, 6)
+        self.auto_task_table = ExcelTable(0, 6)
+        self.auto_task_table.setObjectName("auto_task_table")
+        self.auto_task_table._smart_fill_enabled_columns = {1, 2, 3, 4, 5}
         self.auto_task_table.setHorizontalHeaderLabels(["执行", "项目代码", "目标窗口 (留空用全局)", "图片路径", "文案内容", "状态"])
         self.auto_task_table.horizontalHeader().setStretchLastSection(True)
         self.auto_task_table.setAlternatingRowColors(False)
-        self.auto_task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows if PYQT_VERSION == 6 else QAbstractItemView.SelectRows)
+        self.auto_task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems if PYQT_VERSION == 6 else QAbstractItemView.SelectItems)
         self.auto_task_table.setColumnWidth(0, 56)
         self.auto_task_table.setColumnWidth(1, 190)
         self.auto_task_table.setColumnWidth(2, 210)
@@ -19895,11 +20246,13 @@ class FileManagerPro(QMainWindow):
         t_bar.addWidget(btn_batch_win)
         l_tasks.addLayout(t_bar)
 
-        self.auto_task_table = QTableWidget(0, 6)
+        self.auto_task_table = ExcelTable(0, 6)
+        self.auto_task_table.setObjectName("auto_task_table")
+        self.auto_task_table._smart_fill_enabled_columns = {1, 2, 3, 4, 5}
         self.auto_task_table.setHorizontalHeaderLabels(["执行", "项目代码", "目标窗口 (留空用全局)", "图片路径", "文案内容", "状态"])
         self.auto_task_table.horizontalHeader().setStretchLastSection(True)
         self.auto_task_table.setAlternatingRowColors(False)
-        self.auto_task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows if PYQT_VERSION == 6 else QAbstractItemView.SelectRows)
+        self.auto_task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems if PYQT_VERSION == 6 else QAbstractItemView.SelectItems)
         self.auto_task_table.setColumnWidth(0, 56)
         self.auto_task_table.setColumnWidth(1, 190)
         self.auto_task_table.setColumnWidth(2, 210)
