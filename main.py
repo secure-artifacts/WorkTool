@@ -9012,7 +9012,7 @@ class VideoCopyMatchThread(QThread):
     AUDIO_EXTS = UniversalMatchThread.AUDIO_EXTS
     MEDIA_EXTS = VIDEO_EXTS + AUDIO_EXTS
 
-    def __init__(self, video_input, copy_items, clip_model_name="OFA-Sys/chinese-clip-vit-large-patch14", clip_use_gpu=True, ai_config=None, separate_by_subfolder=False):
+    def __init__(self, video_input, copy_items, clip_model_name="OFA-Sys/chinese-clip-vit-large-patch14", clip_use_gpu=True, ai_config=None, separate_by_subfolder=False, skip_existing_pairs=False):
         super().__init__()
         self.video_input = video_input
         self.copy_items = list(copy_items or [])
@@ -9020,6 +9020,7 @@ class VideoCopyMatchThread(QThread):
         self.clip_use_gpu = clip_use_gpu
         self.ai_config = dict(ai_config or {})
         self.separate_by_subfolder = bool(separate_by_subfolder)
+        self.skip_existing_pairs = bool(skip_existing_pairs)
         self.media_roots = collect_existing_input_roots(video_input)
 
     def _collect_media_files(self, path_input):
@@ -9103,6 +9104,66 @@ class VideoCopyMatchThread(QThread):
             return clean_long_filename(str(text or "").strip(), max_len=120).strip().lower()
         except Exception:
             return str(text or "").strip().lower()
+
+    def _resolve_numeric_media_name(self, media_path):
+        try:
+            stem = os.path.splitext(os.path.basename(str(media_path or "").strip()))[0].strip()
+        except Exception:
+            stem = ""
+        return stem if re.fullmatch(r"\d+", stem or "") else ""
+
+    def _filter_existing_named_pairs(self, video_paths, text_meta):
+        video_paths = list(video_paths or [])
+        text_meta = list(text_meta or [])
+        if not self.skip_existing_pairs:
+            return video_paths, text_meta, []
+
+        videos_by_key = {}
+        for path in video_paths:
+            numeric_name = self._resolve_numeric_media_name(path)
+            if not numeric_name:
+                continue
+            folder_group = compute_relative_group_key(path, self.media_roots)
+            key = (str(folder_group or ""), str(numeric_name or ""))
+            videos_by_key.setdefault(key, []).append(os.path.abspath(path))
+
+        texts_by_key = {}
+        for item in text_meta:
+            numeric_name = str(item.get("numeric_name", "") or "").strip()
+            if not numeric_name:
+                continue
+            folder_group = str(item.get("folder_group", "") or "")
+            key = (folder_group, numeric_name)
+            texts_by_key.setdefault(key, []).append(item)
+
+        skipped_video_paths = set()
+        skipped_text_ids = set()
+        skipped_pairs = []
+        common_keys = sorted(set(videos_by_key.keys()) & set(texts_by_key.keys()), key=lambda x: (x[0], x[1]))
+        for key in common_keys:
+            video_list = sorted(videos_by_key.get(key, []) or [])
+            text_list = sorted(
+                texts_by_key.get(key, []) or [],
+                key=lambda x: str(x.get("source_path", "") or "").lower()
+            )
+            pair_count = min(len(video_list), len(text_list))
+            if pair_count <= 0:
+                continue
+            for idx in range(pair_count):
+                media_path = os.path.abspath(video_list[idx])
+                text_item = text_list[idx]
+                skipped_video_paths.add(media_path)
+                skipped_text_ids.add(id(text_item))
+                skipped_pairs.append({
+                    "media_path": media_path,
+                    "text_path": str(text_item.get("source_path", "") or "").strip(),
+                    "folder_group": key[0],
+                    "numeric_name": key[1],
+                })
+
+        remaining_videos = [os.path.abspath(path) for path in video_paths if os.path.abspath(path) not in skipped_video_paths]
+        remaining_texts = [item for item in text_meta if id(item) not in skipped_text_ids]
+        return remaining_videos, remaining_texts, skipped_pairs
 
     def _item_already_has_target_name(self, item, target_name):
         current_name = ""
@@ -9605,6 +9666,53 @@ class VideoCopyMatchThread(QThread):
                 "blue"
             )
 
+            text_meta = []
+            for idx, item in enumerate(copy_items):
+                try:
+                    text = str(item.get("content", "")).strip()
+                    numeric_name = str(item.get("name", "") or "").strip()
+                    text_meta.append({
+                        "name": clean_long_filename(item.get("name") or build_copy_match_name(text, idx + 1), max_len=80),
+                        "numeric_name": numeric_name if re.fullmatch(r"\d+", numeric_name or "") else "",
+                        "content": text,
+                        "source_path": str(item.get("source_path", "") or ""),
+                        "folder_group": str(item.get("folder_group", "") or ""),
+                    })
+                except Exception as e:
+                    self.log.emit(f"⚠️ 文案处理失败，已跳过第 {idx + 1} 段：{e}", "orange")
+                self.progress.emit(int((idx + 1) / max(1, len(copy_items)) * 10))
+
+            if not text_meta:
+                self.error.emit("文案处理失败，无法进行匹配")
+                return
+
+            video_paths, text_meta, skipped_pairs = self._filter_existing_named_pairs(video_paths, text_meta)
+            if skipped_pairs:
+                self.log.emit(
+                    f"[音频文案匹配] ⏭ 已检测到 {len(skipped_pairs)} 组“同编号文本 + 音频/视频”现成文件，已自动跳过，只匹配缺失项。",
+                    "blue"
+                )
+                preview_pairs = skipped_pairs[:20]
+                for pair in preview_pairs:
+                    folder_note = f"[{pair['folder_group']}] " if pair.get("folder_group") else ""
+                    self.log.emit(
+                        f"[音频文案匹配] {folder_note}跳过现成配对：{pair.get('numeric_name', '')} -> {os.path.basename(pair.get('media_path', '') or '')}",
+                        "gray"
+                    )
+                extra = len(skipped_pairs) - len(preview_pairs)
+                if extra > 0:
+                    self.log.emit(f"[音频文案匹配] 其余 {extra} 组现成配对已省略显示。", "gray")
+
+            if not video_paths:
+                self.progress.emit(100)
+                self.log.emit("[音频文案匹配] ✅ 当前目录里的可匹配媒体都已经有同编号文本，无需再匹配。", "green")
+                self.result.emit([])
+                return
+
+            if not text_meta:
+                self.error.emit("剩余待匹配文件没有可用的数字命名文本；现成配对已被自动跳过。")
+                return
+
             video_meta = []
             total = len(video_paths)
             for idx, path in enumerate(video_paths):
@@ -9637,29 +9745,12 @@ class VideoCopyMatchThread(QThread):
                             os.remove(temp_audio)
                     except Exception:
                         pass
-                self.progress.emit(int((idx + 1) / max(1, total) * 60))
+                self.progress.emit(10 + int((idx + 1) / max(1, total) * 50))
 
             if not video_meta:
                 self.error.emit("所有视频都无法完成音频转写，无法进行文案匹配")
                 return
-
-            text_meta = []
-            for idx, item in enumerate(copy_items):
-                try:
-                    text = str(item.get("content", "")).strip()
-                    text_meta.append({
-                        "name": clean_long_filename(item.get("name") or build_copy_match_name(text, idx + 1), max_len=80),
-                        "content": text,
-                        "source_path": str(item.get("source_path", "") or ""),
-                        "folder_group": str(item.get("folder_group", "") or ""),
-                    })
-                except Exception as e:
-                    self.log.emit(f"⚠️ 文案处理失败，已跳过第 {idx + 1} 段：{e}", "orange")
-                self.progress.emit(60 + int((idx + 1) / max(1, len(copy_items)) * 10))
-
-            if not text_meta:
-                self.error.emit("文案处理失败，无法进行匹配")
-                return
+            self.progress.emit(60)
 
             results = []
             if self.separate_by_subfolder:
@@ -22593,6 +22684,10 @@ class FileManagerPro(QMainWindow):
         self.uni_match_split_subfolder_check = QCheckBox("每个子文件夹单独匹配")
         self.uni_match_split_subfolder_check.setToolTip("勾选后，会按相对同名子目录分别匹配；不同子文件夹之间不再共用文本，也不会把预览名称全局串号。")
         cfg_row.addWidget(self.uni_match_split_subfolder_check)
+        self.uni_match_skip_existing_pairs_check = QCheckBox("已有成对文件跳过")
+        self.uni_match_skip_existing_pairs_check.setChecked(True)
+        self.uni_match_skip_existing_pairs_check.setToolTip("勾选后，如果同一相对子目录下已经同时存在同编号文本和音频/视频（如 1.txt + 1.mp4），这组会直接跳过，只匹配缺失项。")
+        cfg_row.addWidget(self.uni_match_skip_existing_pairs_check)
         cfg_row.addStretch()
         copy_layout.addLayout(cfg_row)
         asr_help = QLabel(
@@ -22628,6 +22723,7 @@ class FileManagerPro(QMainWindow):
         self.uni_subtitle_mode_combo.currentIndexChanged.connect(self.update_universal_match_mode_ui)
         self.uni_subtitle_mode_combo.currentTextChanged.connect(self.trigger_save)
         self.uni_match_split_subfolder_check.toggled.connect(self.trigger_save)
+        self.uni_match_skip_existing_pairs_check.toggled.connect(self.trigger_save)
         self.uni_match_copy_edit.textChanged.connect(self.trigger_save)
         self.update_universal_match_mode_ui()
 
@@ -22640,6 +22736,11 @@ class FileManagerPro(QMainWindow):
         if hasattr(self, "uni_match_name_source_combo"):
             return str(self.uni_match_name_source_combo.currentData() or "auto")
         return "auto"
+
+    def get_universal_match_skip_existing_pairs(self):
+        if hasattr(self, "uni_match_skip_existing_pairs_check"):
+            return bool(self.uni_match_skip_existing_pairs_check.isChecked())
+        return False
 
     def _on_universal_match_name_source_changed(self):
         self.trigger_save()
@@ -22766,6 +22867,8 @@ class FileManagerPro(QMainWindow):
             self.btn_uni_run_txt_only.setVisible(is_text)
         if hasattr(self, "uni_match_split_subfolder_check"):
             self.uni_match_split_subfolder_check.setVisible(is_text)
+        if hasattr(self, "uni_match_skip_existing_pairs_check"):
+            self.uni_match_skip_existing_pairs_check.setVisible(is_text)
         subtitle_mode = str(self.uni_subtitle_mode_combo.currentData() or "transcribe") if hasattr(self, "uni_subtitle_mode_combo") else "transcribe"
         is_script_mode = subtitle_mode in {"script_blocks", "script_files"}
         if hasattr(self, "uni_match_copy_tip"):
@@ -22814,6 +22917,7 @@ class FileManagerPro(QMainWindow):
             QMessageBox.warning(self, "提示", "请先设置音频/视频来源；你也可以直接拖一个同时含视频和 txt 的总文件夹")
             return
         separate_by_subfolder = bool(self.uni_match_split_subfolder_check.isChecked()) if hasattr(self, "uni_match_split_subfolder_check") else False
+        skip_existing_pairs = self.get_universal_match_skip_existing_pairs()
         raw_copy_items = build_copy_items_from_sources(
             text_source,
             raw_copy,
@@ -22840,7 +22944,8 @@ class FileManagerPro(QMainWindow):
             clip_model_name=clip_model_name,
             clip_use_gpu=clip_use_gpu,
             ai_config=ai_cfg,
-            separate_by_subfolder=separate_by_subfolder
+            separate_by_subfolder=separate_by_subfolder,
+            skip_existing_pairs=skip_existing_pairs
         )
         self.uni_copy_match_thread.progress.connect(self.uni_progress_bar.setValue)
         self.uni_copy_match_thread.log.connect(self.log)
@@ -29016,6 +29121,8 @@ class FileManagerPro(QMainWindow):
                     self.uni_match_name_source_combo.setCurrentIndex(idx if idx >= 0 else 0)
                 except Exception:
                     self.uni_match_name_source_combo.setCurrentIndex(0)
+            if hasattr(self, "uni_match_skip_existing_pairs_check") and is_alive(self.uni_match_skip_existing_pairs_check):
+                self.uni_match_skip_existing_pairs_check.setChecked(bool(cfg.get("universal_match_skip_existing_pairs", True)))
             # 核心改进：按照保存的顺序恢复标签页
             heygen_data = cfg.get("heygen_projects", {})
             heygen_order = cfg.get("heygen_projects_order", list(heygen_data.keys()))
@@ -29223,6 +29330,7 @@ class FileManagerPro(QMainWindow):
                 "watermark_config": self.watermark_tab.get_config() if hasattr(self.watermark_tab, "get_config") and is_alive(self.watermark_tab) else {},
                 "video_concat_config": self.video_concat_tab.get_config() if hasattr(self, "video_concat_tab") and is_alive(self.video_concat_tab) else {},
                 "universal_match_name_source": self.get_universal_match_name_source_mode() if hasattr(self, "get_universal_match_name_source_mode") else "auto",
+                "universal_match_skip_existing_pairs": self.get_universal_match_skip_existing_pairs() if hasattr(self, "get_universal_match_skip_existing_pairs") else True,
                 "ai_config": ai_cfg,
                 "review_ai_config": review_ai_cfg,
                 "review_issue_library": review_issue_library,
