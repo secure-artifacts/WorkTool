@@ -9112,7 +9112,13 @@ class VideoCopyMatchThread(QThread):
             current_name = ""
         if not current_name or not target_name:
             return False
-        return self._normalize_match_name_token(current_name) == self._normalize_match_name_token(target_name)
+        current_norm = self._normalize_match_name_token(current_name)
+        target_norm = self._normalize_match_name_token(target_name)
+        if not re.fullmatch(r"\d+", current_norm or ""):
+            return False
+        if not re.fullmatch(r"\d+", target_norm or ""):
+            return False
+        return current_norm == target_norm
 
     def _finalize_match_result_names(self, results):
         used_names_by_folder = {}
@@ -9135,10 +9141,15 @@ class VideoCopyMatchThread(QThread):
                     base_name = original_stem
             dup_total = int(item.get("duplicate_total", 0) or 0)
             dup_index = int(item.get("duplicate_index", 0) or 0)
+            exact_text_rename = bool(item.get("exact_text_rename", False))
             preferred_name = base_name
             if match_status != "unmatched" and dup_total > 1 and dup_index > 1:
-                repeat_prefix = "重复-" if dup_index == 2 else f"重复{dup_index - 1}-"
-                preferred_name = clean_long_filename(f"{repeat_prefix}{base_name}", max_len=80) or f"repeat_{dup_index}_{base_name}"
+                if exact_text_rename:
+                    repeat_name = f"重复[{base_name}]" if dup_index == 2 else f"重复{dup_index - 1}[{base_name}]"
+                    preferred_name = clean_long_filename(repeat_name, max_len=80) or repeat_name
+                else:
+                    repeat_prefix = "重复-" if dup_index == 2 else f"重复{dup_index - 1}-"
+                    preferred_name = clean_long_filename(f"{repeat_prefix}{base_name}", max_len=80) or f"repeat_{dup_index}_{base_name}"
             candidate = preferred_name or base_name or "match_result"
             seq = 2
             while candidate in used_names:
@@ -9254,6 +9265,7 @@ class VideoCopyMatchThread(QThread):
                 results.append({
                     "src_label": best_name,
                     "rename_name": best_name,
+                    "exact_text_rename": True,
                     "res": video["path"],
                     "score": score_text,
                     "srt_path": "",
@@ -23075,17 +23087,33 @@ class FileManagerPro(QMainWindow):
         def _abs(path):
             return os.path.abspath(str(path or "").strip())
 
-        def _find_available_target_path(preferred_path, reserved_paths=None, movable_source_paths=None):
+        def _find_available_target_path(preferred_path, reserved_paths=None, movable_source_paths=None, collision_source_path=""):
             reserved = set(_abs(p) for p in (reserved_paths or set()) if str(p or "").strip())
             movable = set(_abs(p) for p in (movable_source_paths or set()) if str(p or "").strip())
             candidate = _abs(preferred_path)
-            base_no_ext, ext = os.path.splitext(candidate)
-            seq = 2
-            while (
-                (os.path.exists(candidate) and candidate not in movable)
-                or candidate in reserved
-            ):
-                candidate = f"{base_no_ext}_{seq}{ext}"
+            if not ((os.path.exists(candidate) and candidate not in movable) or candidate in reserved):
+                return candidate
+            folder = os.path.dirname(candidate)
+            target_stem, ext = os.path.splitext(os.path.basename(candidate))
+            collision_stem = ""
+            try:
+                collision_stem = clean_long_filename(
+                    os.path.splitext(os.path.basename(str(collision_source_path or "").strip()))[0],
+                    max_len=40
+                ).strip()
+            except Exception:
+                collision_stem = ""
+            collision_stem = collision_stem or "原名"
+            seq = 1
+            while True:
+                if seq == 1:
+                    merged_stem = clean_long_filename(f"{target_stem}[{collision_stem}]", max_len=120).strip()
+                else:
+                    merged_stem = clean_long_filename(f"{target_stem}[{collision_stem}-{seq}]", max_len=120).strip()
+                merged_stem = merged_stem or f"{target_stem}[{collision_stem}]"
+                candidate = os.path.join(folder, f"{merged_stem}{ext}")
+                if not ((os.path.exists(candidate) and candidate not in movable) or candidate in reserved):
+                    break
                 seq += 1
             return candidate
 
@@ -23153,7 +23181,8 @@ class FileManagerPro(QMainWindow):
             item["final_main"] = _find_available_target_path(
                 item["desired_main"],
                 reserved_paths=planned_main_paths,
-                movable_source_paths=main_source_paths
+                movable_source_paths=main_source_paths,
+                collision_source_path=item["res_abs"]
             )
             planned_main_paths.add(item["final_main"])
 
@@ -23178,7 +23207,8 @@ class FileManagerPro(QMainWindow):
                 item[final_key] = _find_available_target_path(
                     desired_path,
                     reserved_paths=planned_paths,
-                    movable_source_paths=source_paths
+                    movable_source_paths=source_paths,
+                    collision_source_path=src_path
                 )
                 planned_paths.add(item[final_key])
 
