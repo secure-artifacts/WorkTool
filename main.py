@@ -23016,11 +23016,6 @@ class FileManagerPro(QMainWindow):
             res_ext = os.path.splitext(str(m.get('res', '') or res_rel))[1]
             is_rename_preview = bool(rename_name) and not srt_abs and not txt_abs
             display_label = f"{rename_name}{res_ext}" if is_rename_preview and res_ext else (rename_name if is_rename_preview else (m.get('src_label', '') or rename_name))
-            dup_total = int(m.get("duplicate_total", 0) or 0)
-            dup_index = int(m.get("duplicate_index", 0) or 0)
-            dup_tag = f" [重复{dup_index}/{dup_total}]" if dup_total > 1 and dup_index > 0 else ""
-            if dup_tag:
-                display_label = f"{display_label}{dup_tag}"
             tooltip = str(m.get('tooltip', '') or '').strip()
             duplicate_note = str(m.get("duplicate_note", "") or "").strip()
             if duplicate_note and duplicate_note not in tooltip:
@@ -23087,7 +23082,7 @@ class FileManagerPro(QMainWindow):
         def _abs(path):
             return os.path.abspath(str(path or "").strip())
 
-        def _find_available_target_path(preferred_path, reserved_paths=None, movable_source_paths=None, collision_source_path=""):
+        def _find_available_target_path(preferred_path, reserved_paths=None, movable_source_paths=None, collision_source_path="", prefer_text_repeat=False):
             reserved = set(_abs(p) for p in (reserved_paths or set()) if str(p or "").strip())
             movable = set(_abs(p) for p in (movable_source_paths or set()) if str(p or "").strip())
             candidate = _abs(preferred_path)
@@ -23106,11 +23101,17 @@ class FileManagerPro(QMainWindow):
             collision_stem = collision_stem or "原名"
             seq = 1
             while True:
-                if seq == 1:
-                    merged_stem = clean_long_filename(f"{target_stem}[{collision_stem}]", max_len=120).strip()
+                if prefer_text_repeat:
+                    if seq == 1:
+                        merged_stem = clean_long_filename(f"重复[{target_stem}]", max_len=120).strip()
+                    else:
+                        merged_stem = clean_long_filename(f"重复{seq}[{target_stem}]", max_len=120).strip()
                 else:
-                    merged_stem = clean_long_filename(f"{target_stem}[{collision_stem}-{seq}]", max_len=120).strip()
-                merged_stem = merged_stem or f"{target_stem}[{collision_stem}]"
+                    if seq == 1:
+                        merged_stem = clean_long_filename(f"{target_stem}[{collision_stem}]", max_len=120).strip()
+                    else:
+                        merged_stem = clean_long_filename(f"{target_stem}[{collision_stem}-{seq}]", max_len=120).strip()
+                merged_stem = merged_stem or (f"重复[{target_stem}]" if prefer_text_repeat else f"{target_stem}[{collision_stem}]")
                 candidate = os.path.join(folder, f"{merged_stem}{ext}")
                 if not ((os.path.exists(candidate) and candidate not in movable) or candidate in reserved):
                     break
@@ -23165,6 +23166,7 @@ class FileManagerPro(QMainWindow):
             self.log(f"[全能对位] 重命名完成，成功处理 {count} 个文件；跳过 {skipped} 个；失败 {failed} 个", "green")
             return
 
+        prefer_text_repeat = self.get_universal_match_mode() == "audio_text"
         main_source_paths = {_abs(item["res_abs"]) for item in rows}
         reserved_main_paths = set()
         for item in rows:
@@ -23182,7 +23184,8 @@ class FileManagerPro(QMainWindow):
                 item["desired_main"],
                 reserved_paths=planned_main_paths,
                 movable_source_paths=main_source_paths,
-                collision_source_path=item["res_abs"]
+                collision_source_path=item["res_abs"],
+                prefer_text_repeat=prefer_text_repeat
             )
             planned_main_paths.add(item["final_main"])
 
