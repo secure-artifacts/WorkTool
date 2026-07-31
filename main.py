@@ -3274,19 +3274,79 @@ def _char_ngrams(text, n=2):
         return {text}
     return {text[i:i+n] for i in range(len(text) - n + 1)}
 
-def score_transcript_against_copy(transcript, copy_text):
+def compute_transcript_copy_match_metrics(transcript, copy_text):
     a = normalize_spoken_text(transcript)
     b = normalize_spoken_text(copy_text)
+    empty_result = {
+        "score": 0.0,
+        "ratio": 0.0,
+        "short_cov": 0.0,
+        "long_cov": 0.0,
+        "gram_ratio": 0.0,
+        "len_ratio": 0.0,
+        "partial_penalty": 0.0,
+        "aligned_bonus": 0.0,
+        "common_len": 0,
+        "a_len": len(a),
+        "b_len": len(b),
+    }
     if not a or not b:
-        return 0.0
-    ratio = SequenceMatcher(None, a, b).ratio()
-    match = SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
-    lcs_ratio = float(match.size) / max(1, min(len(a), len(b)))
+        return empty_result
+
+    sm = SequenceMatcher(None, a, b)
+    ratio = sm.ratio()
+    match = sm.find_longest_match(0, len(a), 0, len(b))
+    common_len = int(match.size or 0)
+    short_cov = float(common_len) / max(1, min(len(a), len(b)))
+    long_cov = float(common_len) / max(1, max(len(a), len(b)))
+    len_ratio = min(len(a), len(b)) / max(1, max(len(a), len(b)))
+
     grams_a = _char_ngrams(a, 2)
     grams_b = _char_ngrams(b, 2)
     gram_ratio = (len(grams_a & grams_b) / max(1, len(grams_a | grams_b))) if grams_a and grams_b else 0.0
-    contains_bonus = 0.12 if (len(a) >= 8 and a in b) or (len(b) >= 8 and b in a) else 0.0
-    return max(0.0, min(1.0, ratio * 0.45 + lcs_ratio * 0.35 + gram_ratio * 0.20 + contains_bonus))
+
+    containment = (len(a) >= 8 and a in b) or (len(b) >= 8 and b in a)
+    partial_penalty = 0.0
+    if containment and short_cov >= 0.88 and long_cov < 0.55:
+        partial_penalty += (0.55 - long_cov) * 0.35
+        if len_ratio < 0.85:
+            partial_penalty += (0.85 - len_ratio) * 0.20
+    elif short_cov >= 0.90 and long_cov < 0.45:
+        partial_penalty += (0.45 - long_cov) * 0.30
+    partial_penalty = min(0.18, max(0.0, partial_penalty))
+
+    aligned_bonus = 0.0
+    if short_cov >= 0.82 and long_cov >= 0.72:
+        aligned_bonus += 0.05
+    if len_ratio >= 0.88 and ratio >= 0.72:
+        aligned_bonus += 0.03
+
+    score = (
+        ratio * 0.34
+        + short_cov * 0.22
+        + long_cov * 0.24
+        + gram_ratio * 0.12
+        + len_ratio * 0.08
+        + aligned_bonus
+        - partial_penalty
+    )
+    score = max(0.0, min(1.0, score))
+    return {
+        "score": score,
+        "ratio": ratio,
+        "short_cov": short_cov,
+        "long_cov": long_cov,
+        "gram_ratio": gram_ratio,
+        "len_ratio": len_ratio,
+        "partial_penalty": partial_penalty,
+        "aligned_bonus": aligned_bonus,
+        "common_len": common_len,
+        "a_len": len(a),
+        "b_len": len(b),
+    }
+
+def score_transcript_against_copy(transcript, copy_text):
+    return compute_transcript_copy_match_metrics(transcript, copy_text)["score"]
 
 def format_srt_timestamp(seconds):
     try:
@@ -3453,6 +3513,44 @@ def build_copy_items_from_sources(path_input="", manual_text="", dedup_scope="gl
                 explicit_name=item.get("explicit_name", False)
             )
     return items
+
+def _resolve_numeric_copy_name(item):
+    if not isinstance(item, dict):
+        return ""
+    candidates = [
+        str(item.get("name", "") or "").strip(),
+        str(item.get("source_stem", "") or "").strip(),
+    ]
+    source_path = str(item.get("source_path", "") or "").strip()
+    if source_path:
+        candidates.append(os.path.splitext(os.path.basename(source_path))[0].strip())
+    for candidate in candidates:
+        if re.fullmatch(r"\d+", candidate):
+            return candidate
+    return ""
+
+def filter_numeric_named_copy_items(items):
+    """
+    音频对白匹配模式专用：
+    只保留“文件名是纯数字”的文本来源，例如 1.txt / 2.txt。
+    像 “Có lẽ sẽ...” 这类长文件名文本会被自动忽略，避免误参与匹配。
+    """
+    filtered = []
+    seen = set()
+    for item in items or []:
+        numeric_name = _resolve_numeric_copy_name(item)
+        if not numeric_name:
+            continue
+        normalized = dict(item)
+        normalized["name"] = numeric_name
+        normalized["source_stem"] = numeric_name
+        content_sig = normalize_spoken_text(normalized.get("content", ""))
+        sig = (numeric_name, content_sig)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        filtered.append(normalized)
+    return filtered
 
 def strip_subtitle_source_text(raw_text, source_path=""):
     text = str(raw_text or "").replace("\r\n", "\n")
@@ -9000,24 +9098,45 @@ class VideoCopyMatchThread(QThread):
                     item["duplicate_note"] = f"重复素材组 {duplicate_groups}：与 {ref_name} 重复（第 {idx}/{total} 个）"
         return duplicate_groups, duplicate_videos
 
+    def _normalize_match_name_token(self, text):
+        try:
+            return clean_long_filename(str(text or "").strip(), max_len=120).strip().lower()
+        except Exception:
+            return str(text or "").strip().lower()
+
+    def _item_already_has_target_name(self, item, target_name):
+        current_name = ""
+        try:
+            current_name = os.path.splitext(os.path.basename(str((item or {}).get("res", "") or "").strip()))[0].strip()
+        except Exception:
+            current_name = ""
+        if not current_name or not target_name:
+            return False
+        return self._normalize_match_name_token(current_name) == self._normalize_match_name_token(target_name)
+
     def _finalize_match_result_names(self, results):
         used_names_by_folder = {}
         for item in results or []:
             folder_key = os.path.dirname(os.path.abspath(str(item.get("res", "") or ""))).lower()
             used_names = used_names_by_folder.setdefault(folder_key, set())
-            base_name = clean_long_filename(
-                str(item.get("rename_name", "") or item.get("src_label", "") or "").strip(),
+            match_status = str(item.get("match_status", "matched") or "matched").strip().lower()
+            original_stem = clean_long_filename(
+                os.path.splitext(os.path.basename(str(item.get("res", "") or "")))[0],
                 max_len=80
-            ).strip()
-            if not base_name:
+            ).strip() or "未命名视频"
+            if match_status == "unmatched":
+                base_name = clean_long_filename(f"未匹配-{original_stem}", max_len=80).strip()
+            else:
                 base_name = clean_long_filename(
-                    os.path.splitext(os.path.basename(str(item.get("res", "") or "")))[0],
+                    str(item.get("rename_name", "") or item.get("src_label", "") or "").strip(),
                     max_len=80
                 ).strip()
+                if not base_name:
+                    base_name = original_stem
             dup_total = int(item.get("duplicate_total", 0) or 0)
             dup_index = int(item.get("duplicate_index", 0) or 0)
             preferred_name = base_name
-            if dup_total > 1 and dup_index > 1:
+            if match_status != "unmatched" and dup_total > 1 and dup_index > 1:
                 repeat_prefix = "重复-" if dup_index == 2 else f"重复{dup_index - 1}-"
                 preferred_name = clean_long_filename(f"{repeat_prefix}{base_name}", max_len=80) or f"repeat_{dup_index}_{base_name}"
             candidate = preferred_name or base_name or "match_result"
@@ -9033,6 +9152,73 @@ class VideoCopyMatchThread(QThread):
                 item["tooltip"] = f"{duplicate_note}\n\n{tooltip}" if tooltip else duplicate_note
         return results
 
+    def _is_confident_text_match(self, best_score, second_score=0.0, transcript=""):
+        transcript_norm = normalize_spoken_text(transcript)
+        if not transcript_norm:
+            return False, "转写为空"
+        try:
+            best_score = float(best_score or 0.0)
+        except Exception:
+            best_score = 0.0
+        try:
+            second_score = float(second_score or 0.0)
+        except Exception:
+            second_score = 0.0
+        if best_score < 0.72:
+            return False, f"最佳得分过低（{best_score * 100:.1f}）"
+        if second_score > 0 and best_score < 0.90 and (best_score - second_score) < 0.08:
+            return False, f"候选过近（{best_score * 100:.1f} vs {second_score * 100:.1f}）"
+        return True, ""
+
+    def _annotate_duplicate_text_matches(self, results):
+        grouped = {}
+        for item in results or []:
+            if str(item.get("match_status", "matched") or "matched").strip().lower() != "matched":
+                item["duplicate_group"] = 0
+                item["duplicate_index"] = 0
+                item["duplicate_total"] = 0
+                item["duplicate_note"] = ""
+                continue
+            key = str(item.get("src_label", "") or item.get("rename_name", "") or "").strip()
+            if not key:
+                item["duplicate_group"] = 0
+                item["duplicate_index"] = 0
+                item["duplicate_total"] = 0
+                item["duplicate_note"] = ""
+                continue
+            grouped.setdefault(key, []).append(item)
+        duplicate_groups = 0
+        duplicate_videos = 0
+        for target_name, items in grouped.items():
+            if len(items) <= 1:
+                item = items[0]
+                item["duplicate_group"] = 0
+                item["duplicate_index"] = 0
+                item["duplicate_total"] = 0
+                item["duplicate_note"] = ""
+                continue
+            duplicate_groups += 1
+            ordered_items = sorted(
+                items,
+                key=lambda x: (
+                    0 if self._item_already_has_target_name(x, target_name) else 1,
+                    -float(x.get("score", 0) or 0),
+                    str(x.get("res", "") or "").lower()
+                )
+            )
+            duplicate_videos += len(ordered_items)
+            total = len(ordered_items)
+            target_name = str(target_name or ordered_items[0].get("src_label", "") or ordered_items[0].get("rename_name", "") or "").strip()
+            for idx, item in enumerate(ordered_items, 1):
+                item["duplicate_group"] = duplicate_groups
+                item["duplicate_index"] = idx
+                item["duplicate_total"] = total
+                if idx == 1:
+                    item["duplicate_note"] = f"文本 {target_name} 命中 {total} 个视频：当前保留为主结果"
+                else:
+                    item["duplicate_note"] = f"文本 {target_name} 命中 {total} 个视频：当前记为重复 {idx - 1}"
+        return duplicate_groups, duplicate_videos
+
     def _match_group(self, video_meta, text_meta, group_label=""):
         video_meta = list(video_meta or [])
         text_meta = list(text_meta or [])
@@ -9040,78 +9226,72 @@ class VideoCopyMatchThread(QThread):
             return []
         results = []
         group_prefix = f"[{group_label}] " if group_label else ""
-        many_to_one_mode = len(video_meta) > len(text_meta)
-        if many_to_one_mode:
-            self.log.emit(f"[音频文案匹配] {group_prefix}当前视频数量多于文案数量，将允许多个视频命中同一名称。", "gray")
-            for video in video_meta:
-                best_name = ""
-                best_text = ""
-                best_transcript = ""
-                best_sim = -1e9
-                for txt in text_meta:
-                    sim = score_transcript_against_copy(video["transcript"], txt["content"])
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_name = txt["name"]
-                        best_text = txt["content"]
-                        best_transcript = video["transcript"]
-                final_score = round(best_sim * 100, 1)
+        if len(video_meta) > len(text_meta):
+            self.log.emit(f"[音频文案匹配] {group_prefix}当前视频数量多于文案数量，将允许多个视频命中同一文本；重复项只在同一文本被多个视频命中时标记。", "gray")
+        else:
+            self.log.emit(f"[音频文案匹配] {group_prefix}当前按“每个视频独立找最佳文本”的方式判断，低分或歧义结果会标记为未匹配。", "gray")
+
+        for video in video_meta:
+            transcript = str(video.get("transcript", "") or "").strip()
+            best_txt = None
+            best_sim = -1.0
+            second_best = -1.0
+            for txt in text_meta:
+                sim = score_transcript_against_copy(transcript, txt["content"])
+                if sim > best_sim:
+                    second_best = best_sim
+                    best_sim = sim
+                    best_txt = txt
+                elif sim > second_best:
+                    second_best = sim
+
+            best_name = str((best_txt or {}).get("name", "") or "").strip()
+            best_text = str((best_txt or {}).get("content", "") or "").strip()
+            matched, reason = self._is_confident_text_match(best_sim, second_best, transcript=transcript)
+            score_text = round(max(0.0, float(best_sim or 0.0)) * 100, 1)
+            second_text = round(max(0.0, float(second_best or 0.0)) * 100, 1)
+            if matched and best_txt:
                 results.append({
                     "src_label": best_name,
                     "rename_name": best_name,
                     "res": video["path"],
-                    "score": final_score,
+                    "score": score_text,
                     "srt_path": "",
-                    "tooltip": f"文案：{best_text}\n\n转写：{best_transcript[:500]}",
-                    "duplicate_group": video.get("duplicate_group", 0),
-                    "duplicate_index": video.get("duplicate_index", 0),
-                    "duplicate_total": video.get("duplicate_total", 0),
-                    "duplicate_note": video.get("duplicate_note", ""),
+                    "tooltip": f"文案：{best_text}\n\n转写：{transcript[:500]}\n\n候选分数：最佳 {score_text} / 次佳 {second_text}",
+                    "match_status": "matched",
+                    "duplicate_group": 0,
+                    "duplicate_index": 0,
+                    "duplicate_total": 0,
+                    "duplicate_note": "",
                 })
                 self.log.emit(
-                    f"✅ {group_prefix}{os.path.basename(video['path'])} → {best_name} (音频匹配得分: {final_score})",
+                    f"✅ {group_prefix}{os.path.basename(video['path'])} → {best_name} (音频匹配得分: {score_text})",
                     "green"
                 )
-            return results
-
-        import numpy as np
-        sims_matrix = []
-        for txt in text_meta:
-            row = []
-            for video in video_meta:
-                row.append(score_transcript_against_copy(video["transcript"], txt["content"]))
-            sims_matrix.append(row)
-        M = len(text_meta)
-        N = len(video_meta)
-        cols = max(M, N)
-        sims_matrix = np.array(sims_matrix, dtype=np.float32)
-        if cols != N:
-            pad = np.full((M, cols - N), -1e9, dtype=np.float32)
-            sims_matrix_pad = np.hstack([sims_matrix, pad])
-        else:
-            sims_matrix_pad = sims_matrix
-        assign_cols = self._hungarian_min_cost((-sims_matrix_pad).tolist())
-        for i, j in enumerate(assign_cols):
-            if j is None or j < 0 or j >= N:
-                continue
-            txt = text_meta[i]
-            video = video_meta[j]
-            final_score = round(float(sims_matrix[i, j]) * 100, 1)
-            results.append({
-                "src_label": txt["name"],
-                "rename_name": txt["name"],
-                "res": video["path"],
-                "score": final_score,
-                "srt_path": "",
-                "tooltip": f"文案：{txt['content']}\n\n转写：{video['transcript'][:500]}",
-                "duplicate_group": video.get("duplicate_group", 0),
-                "duplicate_index": video.get("duplicate_index", 0),
-                "duplicate_total": video.get("duplicate_total", 0),
-                "duplicate_note": video.get("duplicate_note", ""),
-            })
+            else:
+                original_stem = os.path.splitext(os.path.basename(video["path"]))[0]
+                results.append({
+                    "src_label": f"未匹配-{original_stem}",
+                    "rename_name": f"未匹配-{original_stem}",
+                    "res": video["path"],
+                    "score": score_text,
+                    "srt_path": "",
+                    "tooltip": f"未匹配原因：{reason or '没有达到可信阈值'}\n最佳候选：{best_name or '无'}\n最佳 {score_text} / 次佳 {second_text}\n\n转写：{transcript[:500]}",
+                    "match_status": "unmatched",
+                    "duplicate_group": 0,
+                    "duplicate_index": 0,
+                    "duplicate_total": 0,
+                    "duplicate_note": "",
+                })
+                self.log.emit(
+                    f"⚠️ {group_prefix}{os.path.basename(video['path'])} 未匹配（{reason or '没有达到可信阈值'}）",
+                    "orange"
+                )
+        duplicate_groups, duplicate_videos = self._annotate_duplicate_text_matches(results)
+        if duplicate_groups > 0:
             self.log.emit(
-                f"✅ {group_prefix}{os.path.basename(video['path'])} → {txt['name']} (音频匹配得分: {final_score})",
-                "green"
+                f"[音频文案匹配] {group_prefix}检测到 {duplicate_groups} 组“同一文本命中多个视频”，共 {duplicate_videos} 个文件；只有这些结果会标记重复。",
+                "orange"
             )
         return results
 
@@ -9438,13 +9618,6 @@ class VideoCopyMatchThread(QThread):
             if not video_meta:
                 self.error.emit("所有视频都无法完成音频转写，无法进行文案匹配")
                 return
-
-            duplicate_groups, duplicate_videos = self._annotate_duplicate_videos(video_meta)
-            if duplicate_groups > 0:
-                self.log.emit(
-                    f"[音频文案匹配] ⚠️ 检测到 {duplicate_groups} 组疑似重复视频，共 {duplicate_videos} 个文件；结果里会自动标记“重复2/重复3”方便区分。",
-                    "orange"
-                )
 
             text_meta = []
             for idx, item in enumerate(copy_items):
@@ -22337,6 +22510,10 @@ class FileManagerPro(QMainWindow):
         self.uni_match_mode_combo = QComboBox()
         self.uni_match_mode_combo.addItem("普通素材对位（图片/视频/音频）", "general")
         self.uni_match_mode_combo.addItem("音频/视频对白对文本命名", "audio_text")
+        self.uni_match_mode_combo.setToolTip(
+            "普通素材对位：综合 CLIP 视觉语义、音频波形包络、文件名相似度来找对应关系。\n"
+            "音频/视频对白对文本命名：先转写音频，再把对白内容和 txt / 手填文案做语义匹配。"
+        )
         mode_layout.addWidget(self.uni_match_mode_combo, 1)
         mode_layout.addSpacing(10)
         mode_layout.addWidget(QLabel("命名来源:"))
@@ -22369,6 +22546,14 @@ class FileManagerPro(QMainWindow):
         self.uni_match_asr_model_combo = QComboBox()
         self.uni_match_asr_model_combo.addItems(["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"])
         self.uni_match_asr_model_combo.setCurrentText("small")
+        self.uni_match_asr_model_combo.setToolTip(
+            "tiny：最快，适合先粗略跑一遍。\n"
+            "base：比 tiny 稍稳，仍然偏快。\n"
+            "small：速度和准确率最均衡，默认推荐。\n"
+            "medium：口音/噪声较多时更稳，但更慢。\n"
+            "large-v3：准确率最高，最吃显存和时间。\n"
+            "large-v3-turbo：接近 large-v3 的效果，但整体更快，机器配置够时优先选它。"
+        )
         cfg_row.addWidget(self.uni_match_asr_model_combo)
         self.btn_install_faster_whisper = QPushButton("安装 faster-whisper")
         self.btn_install_faster_whisper.clicked.connect(self.install_faster_whisper_for_match)
@@ -22386,6 +22571,13 @@ class FileManagerPro(QMainWindow):
         cfg_row.addWidget(self.uni_match_split_subfolder_check)
         cfg_row.addStretch()
         copy_layout.addLayout(cfg_row)
+        asr_help = QLabel(
+            "模型怎么选：`small` 适合大多数日常批量匹配；`medium` / `large-v3-turbo` 适合口音重、环境吵、多人说话；"
+            "`tiny` / `base` 适合先求速度、后续再精修。"
+        )
+        asr_help.setWordWrap(True)
+        asr_help.setStyleSheet("color: #6b7280; font-size: 11px; padding: 0 2px;")
+        copy_layout.addWidget(asr_help)
         self.uni_match_copy_edit = QTextEdit()
         self.uni_match_copy_edit.setFixedHeight(130)
         self.uni_match_copy_edit.setPlaceholderText(
@@ -22511,6 +22703,13 @@ class FileManagerPro(QMainWindow):
         mode = self.get_universal_match_mode()
         is_text = mode == "audio_text"
         if hasattr(self, "uni_match_tip"):
+            self.uni_match_tip.setWordWrap(True)
+            self.uni_match_tip.setToolTip(
+                "普通素材对位会同时参考 3 个维度：\n"
+                "1. CLIP 视觉语义：看画面/封面是否像同一条内容；\n"
+                "2. Envelope 波形包络：看音频节奏、停顿、强弱是否接近；\n"
+                "3. 文件名：作为辅助线索，避免明显的错配。"
+            )
             if is_text:
                 self.uni_match_tip.setText("当前模式：音频/视频对白对文本。下面的字幕模式支持纯转写，也支持按你提供的文本块或多个 TXT 文件顺序，对单个音频/视频生成一个总 SRT。")
             else:
@@ -22591,14 +22790,18 @@ class FileManagerPro(QMainWindow):
             QMessageBox.warning(self, "提示", "请先设置音频/视频来源；你也可以直接拖一个同时含视频和 txt 的总文件夹")
             return
         separate_by_subfolder = bool(self.uni_match_split_subfolder_check.isChecked()) if hasattr(self, "uni_match_split_subfolder_check") else False
-        copy_items = build_copy_items_from_sources(
+        raw_copy_items = build_copy_items_from_sources(
             text_source,
             raw_copy,
             dedup_scope=("folder" if separate_by_subfolder else "global")
         )
+        copy_items = filter_numeric_named_copy_items(raw_copy_items)
         if not copy_items:
-            QMessageBox.warning(self, "提示", "没有找到可比对的文本。你可以拖入 txt 文件/文件夹，或在下方直接填写“名字|文案”内容。")
+            QMessageBox.warning(self, "提示", "没有找到可比对的数字命名文本。当前模式只会匹配像 1.txt、2.txt 这样的纯数字文件名。")
             return
+        skipped_non_numeric = max(0, len(raw_copy_items) - len(copy_items))
+        if skipped_non_numeric > 0:
+            self.log(f"[音频文案匹配] 已忽略 {skipped_non_numeric} 个非数字命名文本文件；当前只匹配纯数字 txt。", "orange")
         pipeline_cfg = self._get_named_ai_config("pipeline") if hasattr(self, "_get_named_ai_config") else {}
         clip_model_name = str((pipeline_cfg or {}).get("clip_model", "OFA-Sys/chinese-clip-vit-large-patch14") or "OFA-Sys/chinese-clip-vit-large-patch14")
         clip_use_gpu = bool((pipeline_cfg or {}).get("clip_use_gpu", True))
@@ -22865,9 +23068,35 @@ class FileManagerPro(QMainWindow):
 
     def rename_matched_universal(self):
         count = 0
-        planned_targets = set()
         skipped = 0
         failed = 0
+        rows = []
+
+        def _abs(path):
+            return os.path.abspath(str(path or "").strip())
+
+        def _find_available_target_path(preferred_path, reserved_paths=None, movable_source_paths=None):
+            reserved = set(_abs(p) for p in (reserved_paths or set()) if str(p or "").strip())
+            movable = set(_abs(p) for p in (movable_source_paths or set()) if str(p or "").strip())
+            candidate = _abs(preferred_path)
+            base_no_ext, ext = os.path.splitext(candidate)
+            seq = 2
+            while (
+                (os.path.exists(candidate) and candidate not in movable)
+                or candidate in reserved
+            ):
+                candidate = f"{base_no_ext}_{seq}{ext}"
+                seq += 1
+            return candidate
+
+        def _make_temp_path(src_path):
+            folder = os.path.dirname(src_path)
+            _, ext = os.path.splitext(src_path)
+            while True:
+                candidate = os.path.join(folder, f".__rename_tmp__{uuid.uuid4().hex}{ext}")
+                if not os.path.exists(candidate):
+                    return candidate
+
         for i in range(self.uni_match_table.rowCount()):
             it_src = self.uni_match_table.item(i, 0); it_res = self.uni_match_table.item(i, 1)
             if not it_src or not it_res: continue
@@ -22885,67 +23114,116 @@ class FileManagerPro(QMainWindow):
             if not rename_name and res_abs:
                 rename_name = os.path.splitext(os.path.basename(str(res_abs)))[0]
             src_name = clean_long_filename(rename_name, 120)
-            res_dir = os.path.dirname(res_abs); res_ext = os.path.splitext(res_abs)[1]; new_p = os.path.join(res_dir, f"{src_name}{res_ext}")
+            res_dir = os.path.dirname(res_abs); res_ext = os.path.splitext(res_abs)[1]; desired_main = os.path.join(res_dir, f"{src_name}{res_ext}")
             srt_path = str(it_src.data(_UserRole + 2) or "").strip()
             txt_path = str(it_src.data(_UserRole + 3) or "").strip()
-            if res_abs != new_p:
-                try:
-                    base_no_ext, ext = os.path.splitext(new_p)
-                    seq = 2
-                    while (os.path.exists(new_p) and os.path.abspath(new_p) != os.path.abspath(res_abs)) or (os.path.abspath(new_p) in planned_targets):
-                        new_p = f"{base_no_ext}_{seq}{ext}"
-                        seq += 1
-                    os.rename(res_abs, new_p); it_res.setText(os.path.basename(new_p)); it_res.setData(_UserRole, new_p); count += 1
-                    planned_targets.add(os.path.abspath(new_p))
-                    if srt_path and os.path.exists(srt_path):
-                        try:
-                            srt_target = os.path.splitext(new_p)[0] + ".srt"
-                            srt_base, srt_ext = os.path.splitext(srt_target)
-                            srt_seq = 2
-                            while (
-                                (os.path.exists(srt_target) and os.path.abspath(srt_target) != os.path.abspath(srt_path))
-                                or os.path.abspath(srt_target) in planned_targets
-                            ):
-                                srt_target = f"{srt_base}_{srt_seq}{srt_ext}"
-                                srt_seq += 1
-                            os.rename(srt_path, srt_target)
-                            it_src.setData(_UserRole + 2, srt_target)
-                            it_srt = self.uni_match_table.item(i, 3)
-                            if it_srt:
-                                it_srt.setText(os.path.basename(srt_target))
-                                it_srt.setData(_UserRole, srt_target)
-                                it_srt.setToolTip(srt_target)
-                            planned_targets.add(os.path.abspath(srt_target))
-                        except Exception as e:
-                            self.log(f"SRT 同步重命名失败: {e}", "orange")
-                    if txt_path and os.path.exists(txt_path):
-                        try:
-                            txt_target = os.path.splitext(new_p)[0] + ".txt"
-                            txt_base, txt_ext = os.path.splitext(txt_target)
-                            txt_seq = 2
-                            while (
-                                (os.path.exists(txt_target) and os.path.abspath(txt_target) != os.path.abspath(txt_path))
-                                or os.path.abspath(txt_target) in planned_targets
-                            ):
-                                txt_target = f"{txt_base}_{txt_seq}{txt_ext}"
-                                txt_seq += 1
-                            os.rename(txt_path, txt_target)
-                            it_src.setData(_UserRole + 3, txt_target)
-                            it_txt = self.uni_match_table.item(i, 4)
-                            if it_txt:
-                                it_txt.setText(os.path.basename(txt_target))
-                                it_txt.setData(_UserRole, txt_target)
-                                it_txt.setToolTip(txt_target)
-                            planned_targets.add(os.path.abspath(txt_target))
-                        except Exception as e:
-                            self.log(f"TXT 同步重命名失败: {e}", "orange")
-                except Exception as e:
-                    failed += 1
-                    self.log(f"重命名失败: {e}", "red")
-            else:
+            rows.append({
+                "row": i,
+                "it_src": it_src,
+                "it_res": it_res,
+                "it_srt": self.uni_match_table.item(i, 3),
+                "it_txt": self.uni_match_table.item(i, 4),
+                "src_abs": _abs(src_abs),
+                "res_abs": _abs(res_abs),
+                "desired_main": _abs(desired_main),
+                "final_main": "",
+                "srt_path": _abs(srt_path) if srt_path and os.path.exists(srt_path) else "",
+                "txt_path": _abs(txt_path) if txt_path and os.path.exists(txt_path) else "",
+                "final_srt": "",
+                "final_txt": "",
+            })
+
+        if not rows:
+            self.log(f"[全能对位] 重命名完成，成功处理 {count} 个文件；跳过 {skipped} 个；失败 {failed} 个", "green")
+            return
+
+        main_source_paths = {_abs(item["res_abs"]) for item in rows}
+        reserved_main_paths = set()
+        for item in rows:
+            if item["res_abs"] == item["desired_main"]:
+                item["final_main"] = item["desired_main"]
+                reserved_main_paths.add(item["final_main"])
                 skipped += 1
-                self.log(f"[全能对位] 第 {i+1} 行无需重命名：{os.path.basename(res_abs)}", "gray")
-                planned_targets.add(os.path.abspath(new_p))
+                self.log(f"[全能对位] 第 {item['row']+1} 行无需重命名：{os.path.basename(item['res_abs'])}", "gray")
+
+        planned_main_paths = set(reserved_main_paths)
+        for item in rows:
+            if item["final_main"]:
+                continue
+            item["final_main"] = _find_available_target_path(
+                item["desired_main"],
+                reserved_paths=planned_main_paths,
+                movable_source_paths=main_source_paths
+            )
+            planned_main_paths.add(item["final_main"])
+
+        for support_key, ext in [("srt_path", ".srt"), ("txt_path", ".txt")]:
+            source_paths = {_abs(item.get(support_key, "")) for item in rows if item.get(support_key)}
+            reserved_paths = set()
+            final_key = "final_srt" if support_key == "srt_path" else "final_txt"
+            for item in rows:
+                src_path = item.get(support_key, "")
+                if not src_path:
+                    continue
+                desired_path = os.path.splitext(item["final_main"])[0] + ext
+                if _abs(src_path) == _abs(desired_path):
+                    item[final_key] = _abs(desired_path)
+                    reserved_paths.add(item[final_key])
+            planned_paths = set(reserved_paths)
+            for item in rows:
+                src_path = item.get(support_key, "")
+                if not src_path or item.get(final_key):
+                    continue
+                desired_path = os.path.splitext(item["final_main"])[0] + ext
+                item[final_key] = _find_available_target_path(
+                    desired_path,
+                    reserved_paths=planned_paths,
+                    movable_source_paths=source_paths
+                )
+                planned_paths.add(item[final_key])
+
+        try:
+            main_moves = []
+            for item in rows:
+                if item["res_abs"] == item["final_main"]:
+                    continue
+                temp_path = _make_temp_path(item["res_abs"])
+                os.rename(item["res_abs"], temp_path)
+                main_moves.append((item, temp_path))
+            for item, temp_path in main_moves:
+                os.rename(temp_path, item["final_main"])
+                item["it_res"].setText(os.path.basename(item["final_main"]))
+                item["it_res"].setData(_UserRole, item["final_main"])
+                count += 1
+        except Exception as e:
+            failed += 1
+            self.log(f"主文件重命名失败: {e}", "red")
+
+        for support_key, final_key, role_offset, item_key, label in [
+            ("srt_path", "final_srt", 2, "it_srt", "SRT"),
+            ("txt_path", "final_txt", 3, "it_txt", "TXT"),
+        ]:
+            try:
+                support_moves = []
+                for item in rows:
+                    src_path = item.get(support_key, "")
+                    final_path = item.get(final_key, "")
+                    if not src_path or not final_path or src_path == final_path:
+                        continue
+                    temp_path = _make_temp_path(src_path)
+                    os.rename(src_path, temp_path)
+                    support_moves.append((item, temp_path, final_path))
+                for item, temp_path, final_path in support_moves:
+                    os.rename(temp_path, final_path)
+                    item["it_src"].setData(_UserRole + role_offset, final_path)
+                    table_item = item.get(item_key)
+                    if table_item:
+                        table_item.setText(os.path.basename(final_path))
+                        table_item.setData(_UserRole, final_path)
+                        table_item.setToolTip(final_path)
+            except Exception as e:
+                failed += 1
+                self.log(f"{label} 同步重命名失败: {e}", "orange")
         self.log(f"[全能对位] 重命名完成，成功处理 {count} 个文件；跳过 {skipped} 个；失败 {failed} 个", "green")
     def setup_creator_tab(self):
         layout = QVBoxLayout(self.creator_tab)
