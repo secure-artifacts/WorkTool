@@ -9120,6 +9120,16 @@ class VideoCopyMatchThread(QThread):
             return False
         return current_norm == target_norm
 
+    def _build_text_duplicate_key(self, item):
+        source_path = str((item or {}).get("text_source_path", "") or "").strip()
+        if source_path:
+            return f"path::{os.path.abspath(source_path).lower()}"
+        folder_group = str((item or {}).get("text_folder_group", "") or "").strip().lower()
+        name = str((item or {}).get("src_label", "") or (item or {}).get("rename_name", "") or "").strip().lower()
+        if folder_group:
+            return f"group::{folder_group}::{name}"
+        return f"name::{name}"
+
     def _finalize_match_result_names(self, results):
         used_names_by_folder = {}
         for item in results or []:
@@ -9190,7 +9200,7 @@ class VideoCopyMatchThread(QThread):
                 item["duplicate_total"] = 0
                 item["duplicate_note"] = ""
                 continue
-            key = str(item.get("src_label", "") or item.get("rename_name", "") or "").strip()
+            key = self._build_text_duplicate_key(item)
             if not key:
                 item["duplicate_group"] = 0
                 item["duplicate_index"] = 0
@@ -9266,6 +9276,8 @@ class VideoCopyMatchThread(QThread):
                     "src_label": best_name,
                     "rename_name": best_name,
                     "exact_text_rename": True,
+                    "text_source_path": str((best_txt or {}).get("source_path", "") or ""),
+                    "text_folder_group": str((best_txt or {}).get("folder_group", "") or ""),
                     "res": video["path"],
                     "score": score_text,
                     "srt_path": "",
