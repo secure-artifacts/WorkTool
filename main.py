@@ -111,6 +111,82 @@ SORTER_AUTO_DIR_MARKER = ".ai_sorter_auto_dir"
 _API_THROTTLE_LOCK = Lock()
 _API_NEXT_ALLOWED_TS = {}
 
+# ─────────────────────────────────────────────
+# 路径模板（变量）解析
+# 目标：把所有“输出路径/存放位置”入口统一到同一套解析逻辑
+# - 支持环境变量：${HOME} / %USERPROFILE% 等（os.path.expandvars）
+# - 支持 ~：用户目录（os.path.expanduser）
+# - 支持内置变量：
+#   {date}/{yyyy-MM-dd}、{yyyyMMdd}、{yyyyMM}、{time}/{hhmmss}、{cwd}、{home}
+# - 支持上下文变量：通过 variables 传入，例如 {project}、{src_dir} 等
+# 注意：该函数只在“真正执行写入/导出”时做解析；配置里仍保存用户输入的模板原文。
+# ─────────────────────────────────────────────
+def render_path_template(path_template, variables=None, project_name=""):
+    raw = str(path_template or "").strip().strip('"').strip("'")
+    if not raw:
+        return ""
+
+    # 1) 先展开环境变量与 ~
+    try:
+        raw = os.path.expandvars(os.path.expanduser(raw))
+    except Exception:
+        pass
+
+    # 2) 内置变量
+    try:
+        now = datetime.now()
+    except Exception:
+        now = None
+
+    mapping = {}
+    if now is not None:
+        mapping.update({
+            "{date}": now.strftime("%Y-%m-%d"),
+            "{yyyy-MM-dd}": now.strftime("%Y-%m-%d"),
+            "{yyyyMMdd}": now.strftime("%Y%m%d"),
+            "{yyyyMM}": now.strftime("%Y%m"),
+            "{time}": now.strftime("%H-%M-%S"),
+            "{hhmmss}": now.strftime("%H%M%S"),
+        })
+
+    # 常用系统变量
+    try:
+        mapping["{cwd}"] = os.getcwd()
+    except Exception:
+        mapping["{cwd}"] = ""
+    try:
+        mapping["{home}"] = os.path.expanduser("~")
+    except Exception:
+        mapping["{home}"] = ""
+
+    # project_name 快捷注入（仅在相关模块传入时生效）
+    if project_name:
+        try:
+            safe_project = clean_long_filename(str(project_name or ""), 120)
+        except Exception:
+            safe_project = str(project_name or "")
+        mapping["{project}"] = safe_project
+
+    # 3) 自定义上下文变量（允许传入 "project" 或 "{project}" 两种写法）
+    if isinstance(variables, dict):
+        for k, v in variables.items():
+            key = str(k or "")
+            if not key:
+                continue
+            token = key if key.startswith("{") and key.endswith("}") else ("{" + key + "}")
+            mapping[token] = "" if v is None else str(v)
+
+    # 4) 替换（仅做简单替换，保持兼容现有 {yyyy-MM-dd} 这种带符号 token）
+    for token, value in mapping.items():
+        if token and token in raw:
+            raw = raw.replace(token, value)
+
+    # 5) 规范化路径
+    try:
+        return os.path.normpath(raw)
+    except Exception:
+        return raw
+
 def normalize_api_base(api_base, default=""):
     return (api_base or default or "").strip().rstrip("/")
 
@@ -1674,12 +1750,12 @@ class SubfolderSelectionDialog(QDialog):
         self._all_subfolders = []
         # PyQt5/6 兼容的枚举值，在 init_ui 之前先确定
         if PYQT_VERSION == 6:
-            self._checked   = self._win_checked
+            self._checked   = Qt.CheckState.Checked
             self._unchecked = Qt.CheckState.Unchecked
             self._flag_uc   = (Qt.ItemFlag.ItemIsUserCheckable if PYQT_VERSION == 6 else Qt.ItemIsUserCheckable) | (Qt.ItemFlag.ItemIsEnabled if PYQT_VERSION == 6 else Qt.ItemIsEnabled)
             _ok_cancel      = QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         else:
-            self._checked   = self._win_checked
+            self._checked   = Qt.Checked
             self._unchecked = Qt.Unchecked
             self._flag_uc   = (Qt.ItemFlag.ItemIsUserCheckable if PYQT_VERSION == 6 else Qt.ItemIsUserCheckable) | (Qt.ItemFlag.ItemIsEnabled if PYQT_VERSION == 6 else Qt.ItemIsEnabled)
             _ok_cancel      = QDialogButtonBox.Ok | QDialogButtonBox.Cancel
@@ -3054,9 +3130,6 @@ def _build_vlc_instance_args():
         "--drop-late-frames",
         "--skip-frames",
     ]
-    plugins_dir = str((_VLC_RUNTIME_INFO or {}).get("plugins_dir", "") or "").strip()
-    if plugins_dir:
-        args.append(f"--plugin-path={plugins_dir}")
     return args
 
 class AiMessageFormatter:
@@ -9183,18 +9256,28 @@ class VideoCopyMatchThread(QThread):
 
     def _build_text_duplicate_key(self, item):
         source_path = str((item or {}).get("text_source_path", "") or "").strip()
-        if source_path:
-            return f"path::{os.path.abspath(source_path).lower()}"
         folder_group = str((item or {}).get("text_folder_group", "") or "").strip().lower()
         name = str((item or {}).get("src_label", "") or (item or {}).get("rename_name", "") or "").strip().lower()
+        # 对“纯数字命名”的文本（如 1.txt / 2.txt）：用户期望按编号去重，
+        # 即使来源路径不同（例如同时从 txt 文件 + 手动文本块生成了同名“1”），也应视为同一份编号文本，
+        # 否则会出现重复 key 不被识别，最终在命名阶段被迫生成 1_2.mp4。
+        if re.fullmatch(r"\d+", name or ""):
+            return f"num::{folder_group}::{name}"
+        if source_path:
+            return f"path::{os.path.abspath(source_path).lower()}"
         if folder_group:
             return f"group::{folder_group}::{name}"
         return f"name::{name}"
 
     def _finalize_match_result_names(self, results):
+        # 用于预览/批量重命名时的“同目录重名”处理：
+        # 这里必须按“最终文件名（stem + ext）”去判重，而不是只按 stem。
+        # 否则同一目录下同时存在 1.mp4 和 1.wav（扩展名不同）时，会被误判为冲突，导致出现 1_2.mp4。
         used_names_by_folder = {}
         for item in results or []:
-            folder_key = os.path.dirname(os.path.abspath(str(item.get("res", "") or ""))).lower()
+            res_path = str(item.get("res", "") or "").strip()
+            folder_key = os.path.dirname(os.path.abspath(res_path)).lower()
+            res_ext = os.path.splitext(res_path)[1].lower()
             used_names = used_names_by_folder.setdefault(folder_key, set())
             match_status = str(item.get("match_status", "matched") or "matched").strip().lower()
             original_stem = clean_long_filename(
@@ -9223,10 +9306,13 @@ class VideoCopyMatchThread(QThread):
                     preferred_name = clean_long_filename(f"{repeat_prefix}{base_name}", max_len=80) or f"repeat_{dup_index}_{base_name}"
             candidate = preferred_name or base_name or "match_result"
             seq = 2
-            while candidate in used_names:
+            def _name_key(name):
+                # Windows 下文件名大小写不敏感；同时需要把扩展名也纳入冲突判断
+                return (self._normalize_match_name_token(name), res_ext)
+            while _name_key(candidate) in used_names:
                 candidate = clean_long_filename(f"{preferred_name}_{seq}", max_len=80) or f"{preferred_name}_{seq}"
                 seq += 1
-            used_names.add(candidate)
+            used_names.add(_name_key(candidate))
             item["rename_name"] = candidate
             duplicate_note = str(item.get("duplicate_note", "") or "").strip()
             tooltip = str(item.get("tooltip", "") or "").strip()
@@ -9301,6 +9387,63 @@ class VideoCopyMatchThread(QThread):
                     item["duplicate_note"] = f"文本 {target_name} 命中 {total} 个视频：当前记为重复 {idx - 1}"
         return duplicate_groups, duplicate_videos
 
+    def _suppress_weak_duplicate_text_matches(self, results):
+        """
+        允许“同一文本对应多个视频”，但当某个重复命中明显只是低置信度占位时，将其打回未匹配。
+        规则偏保守：只有在“自身分数不高”且“被同组最高分明显压制/自身备选也很接近”时才压掉。
+        """
+        grouped = {}
+        for item in results or []:
+            if str(item.get("match_status", "matched") or "matched").strip().lower() != "matched":
+                continue
+            key = self._build_text_duplicate_key(item)
+            if not key:
+                continue
+            grouped.setdefault(key, []).append(item)
+
+        suppressed = 0
+        for _, items in grouped.items():
+            if len(items) <= 1:
+                continue
+            ordered_items = sorted(
+                items,
+                key=lambda x: (
+                    -float(x.get("_match_score_raw", 0.0) or 0.0),
+                    str(x.get("res", "") or "").lower()
+                )
+            )
+            top_score = float(ordered_items[0].get("_match_score_raw", 0.0) or 0.0)
+            for item in ordered_items[1:]:
+                own_score = float(item.get("_match_score_raw", 0.0) or 0.0)
+                alt_score = float(item.get("_second_score_raw", 0.0) or 0.0)
+                top_gap = top_score - own_score
+                alt_gap = own_score - alt_score
+                if own_score >= 0.82 and alt_gap >= 0.05:
+                    continue
+                if top_gap < 0.08 and alt_gap >= 0.05:
+                    continue
+
+                original_stem = os.path.splitext(os.path.basename(str(item.get("res", "") or "")))[0]
+                best_name = str(item.get("src_label", "") or item.get("rename_name", "") or "").strip()
+                transcript_preview = str(item.get("_transcript_preview", "") or "").strip()
+                score_text = round(max(0.0, own_score) * 100, 1)
+                top_text = round(max(0.0, top_score) * 100, 1)
+                alt_text = round(max(0.0, alt_score) * 100, 1)
+                item["src_label"] = f"未匹配-{original_stem}"
+                item["rename_name"] = f"未匹配-{original_stem}"
+                item["match_status"] = "unmatched"
+                item["duplicate_group"] = 0
+                item["duplicate_index"] = 0
+                item["duplicate_total"] = 0
+                item["duplicate_note"] = ""
+                item["tooltip"] = (
+                    f"未匹配原因：文本 {best_name or '未知'} 虽然命中，但当前结果在重复命中里明显偏弱，已按疑似占位处理\n"
+                    f"当前分数：{score_text} / 同文本最高：{top_text} / 当前次佳：{alt_text}\n\n"
+                    f"转写：{transcript_preview[:500]}"
+                ).strip()
+                suppressed += 1
+        return suppressed
+
     def _match_group(self, video_meta, text_meta, group_label=""):
         video_meta = list(video_meta or [])
         text_meta = list(text_meta or [])
@@ -9308,49 +9451,84 @@ class VideoCopyMatchThread(QThread):
             return []
         results = []
         group_prefix = f"[{group_label}] " if group_label else ""
-        if len(video_meta) > len(text_meta):
-            self.log.emit(f"[音频文案匹配] {group_prefix}当前视频数量多于文案数量，将允许多个视频命中同一文本；重复项只在同一文本被多个视频命中时标记。", "gray")
-        else:
-            self.log.emit(f"[音频文案匹配] {group_prefix}当前按“每个视频独立找最佳文本”的方式判断，低分或歧义结果会标记为未匹配。", "gray")
+        self.log.emit(
+            f"[音频文案匹配] {group_prefix}当前按“一对一全局最优分配”匹配：每个视频只分配 1 段文本、每段文本最多分配给 1 个视频；避免出现 1_2 这类由重复命中导致的后缀。",
+            "gray"
+        )
 
+        # 1) 先计算相似度矩阵：rows=视频，cols=文本
+        sims = []
+        per_video_second = []
         for video in video_meta:
             transcript = str(video.get("transcript", "") or "").strip()
-            best_txt = None
+            row = []
             best_sim = -1.0
             second_best = -1.0
             for txt in text_meta:
-                sim = score_transcript_against_copy(transcript, txt["content"])
+                sim = score_transcript_against_copy(transcript, txt.get("content", ""))
+                row.append(float(sim or 0.0))
                 if sim > best_sim:
                     second_best = best_sim
                     best_sim = sim
-                    best_txt = txt
                 elif sim > second_best:
                     second_best = sim
+            sims.append(row)
+            per_video_second.append(float(second_best or 0.0))
 
-            best_name = str((best_txt or {}).get("name", "") or "").strip()
-            best_text = str((best_txt or {}).get("content", "") or "").strip()
+        # 2) 匈牙利算法要求 cols >= rows；不足则用“高成本”的虚拟列补齐（表示未分配）
+        rows = len(sims)
+        cols = len(sims[0]) if sims else 0
+        padded_cols = max(cols, rows)
+        BIG_COST = 1e6
+        cost_matrix = []
+        for r in range(rows):
+            row_cost = []
+            for c in range(padded_cols):
+                if c < cols:
+                    # 目标：最大化 sim => 最小化 -sim
+                    row_cost.append(-float(sims[r][c] or 0.0))
+                else:
+                    # 虚拟列：代表“不给任何文本”，用超大成本避免被优先选中
+                    row_cost.append(BIG_COST)
+            cost_matrix.append(row_cost)
+        assign_cols = self._hungarian_min_cost(cost_matrix)  # len=rows；元素 0..padded_cols-1
+
+        # 3) 根据分配结果生成输出
+        for vid_idx, video in enumerate(video_meta):
+            transcript = str(video.get("transcript", "") or "").strip()
+            col_idx = int(assign_cols[vid_idx]) if vid_idx < len(assign_cols) else -1
+            best_txt = text_meta[col_idx] if (0 <= col_idx < len(text_meta)) else None
+            best_sim = float(sims[vid_idx][col_idx] if (best_txt is not None) else -1.0)
+            second_best = float(per_video_second[vid_idx] if vid_idx < len(per_video_second) else -1.0)
+
+            chosen_name = str((best_txt or {}).get("name", "") or "").strip()
+            chosen_text = str((best_txt or {}).get("content", "") or "").strip()
             matched, reason = self._is_confident_text_match(best_sim, second_best, transcript=transcript)
             score_text = round(max(0.0, float(best_sim or 0.0)) * 100, 1)
             second_text = round(max(0.0, float(second_best or 0.0)) * 100, 1)
+
             if matched and best_txt:
                 results.append({
-                    "src_label": best_name,
-                    "rename_name": best_name,
+                    "src_label": chosen_name,
+                    "rename_name": chosen_name,
                     "exact_text_rename": True,
                     "text_source_path": str((best_txt or {}).get("source_path", "") or ""),
                     "text_folder_group": str((best_txt or {}).get("folder_group", "") or ""),
                     "res": video["path"],
                     "score": score_text,
                     "srt_path": "",
-                    "tooltip": f"文案：{best_text}\n\n转写：{transcript[:500]}\n\n候选分数：最佳 {score_text} / 次佳 {second_text}",
+                    "tooltip": f"文案：{chosen_text}\n\n转写：{transcript[:500]}\n\n分配方式：一对一全局最优分配\n候选分数：最佳 {score_text} / 次佳 {second_text}",
                     "match_status": "matched",
                     "duplicate_group": 0,
                     "duplicate_index": 0,
                     "duplicate_total": 0,
                     "duplicate_note": "",
+                    "_match_score_raw": float(best_sim or 0.0),
+                    "_second_score_raw": float(second_best or 0.0),
+                    "_transcript_preview": transcript[:500],
                 })
                 self.log.emit(
-                    f"✅ {group_prefix}{os.path.basename(video['path'])} → {best_name} (音频匹配得分: {score_text})",
+                    f"✅ {group_prefix}{os.path.basename(video['path'])} → {chosen_name} (音频匹配得分: {score_text})",
                     "green"
                 )
             else:
@@ -9361,17 +9539,26 @@ class VideoCopyMatchThread(QThread):
                     "res": video["path"],
                     "score": score_text,
                     "srt_path": "",
-                    "tooltip": f"未匹配原因：{reason or '没有达到可信阈值'}\n最佳候选：{best_name or '无'}\n最佳 {score_text} / 次佳 {second_text}\n\n转写：{transcript[:500]}",
+                    "tooltip": f"未匹配原因：{reason or '没有达到可信阈值'}\n最佳候选：{chosen_name or '无'}\n最佳 {score_text} / 次佳 {second_text}\n\n转写：{transcript[:500]}",
                     "match_status": "unmatched",
                     "duplicate_group": 0,
                     "duplicate_index": 0,
                     "duplicate_total": 0,
                     "duplicate_note": "",
+                    "_match_score_raw": float(best_sim or 0.0),
+                    "_second_score_raw": float(second_best or 0.0),
+                    "_transcript_preview": transcript[:500],
                 })
                 self.log.emit(
                     f"⚠️ {group_prefix}{os.path.basename(video['path'])} 未匹配（{reason or '没有达到可信阈值'}）",
                     "orange"
                 )
+        suppressed = self._suppress_weak_duplicate_text_matches(results)
+        if suppressed > 0:
+            self.log.emit(
+                f"[音频文案匹配] {group_prefix}已压掉 {suppressed} 个疑似误占位的重复命中，避免把唯一正确结果挤成“重复”。",
+                "orange"
+            )
         duplicate_groups, duplicate_videos = self._annotate_duplicate_text_matches(results)
         if duplicate_groups > 0:
             self.log.emit(
@@ -10985,7 +11172,7 @@ class VideoWatermarkTab(QWidget):
         out_layout = QHBoxLayout()
         out_layout.addWidget(QLabel("输出目录:"))
         self.out_path_edit = PathDropTextEdit(accept_dirs=True, accept_files=False)
-        self.out_path_edit.setPlaceholderText("可直接拖入输出目录文件夹")
+        self.out_path_edit.setPlaceholderText("可直接拖入输出目录；支持变量：{date}/{yyyyMMdd}/{time}/{src_dir}，也支持 ${ENV} 与 ~")
         self.out_path_edit.textChanged.connect(self.GLOBAL_WATERMARK_SYNC_SIGNAL.emit)
         out_layout.addWidget(self.out_path_edit)
         btn_browse = QPushButton("浏览")
@@ -11220,7 +11407,15 @@ class VideoWatermarkTab(QWidget):
 
     def run_watermark(self):
         tasks = self._collect_watermark_tasks()
-        out_dir = self.out_path_edit.text().strip().strip('"').strip("'")
+        out_dir_tpl = self.out_path_edit.text().strip().strip('"').strip("'")
+        src_dir = ""
+        try:
+            if tasks:
+                first = tasks[0]
+                src_dir = first if os.path.isdir(first) else os.path.dirname(first)
+        except Exception:
+            src_dir = ""
+        out_dir = render_path_template(out_dir_tpl, variables={"src_dir": src_dir})
         enabled_layers = [layer for layer in self.layers if layer.get("enabled", True)]
         if not tasks:
             QMessageBox.warning(self, "提示", "请先添加有效的视频文件；也可以粘贴视频所在文件夹路径，程序会自动递归扫描")
@@ -14700,6 +14895,10 @@ class VideoConcatTab(QWidget):
         out_layout = QHBoxLayout()
         out_layout.addWidget(QLabel("输出目录:"))
         self.out_path_edit = QLineEdit()
+        try:
+            self.out_path_edit.setPlaceholderText("支持变量：{date}/{yyyyMMdd}/{time}/{src_dir}，也支持 ${ENV} 与 ~")
+        except Exception:
+            pass
         self.out_path_edit.textChanged.connect(self.GLOBAL_VIDEO_CONCAT_SYNC_SIGNAL.emit)
         out_layout.addWidget(self.out_path_edit)
         btn_browse_out = QPushButton("浏览")
@@ -17920,13 +18119,24 @@ class VideoConcatTab(QWidget):
         QMessageBox.information(self, "组合检查通过", summary)
 
     def run_concat(self):
-        out_dir = self.out_path_edit.text().strip().strip('"').strip("'")
-        if not out_dir:
+        out_dir_tpl = self.out_path_edit.text().strip().strip('"').strip("'")
+        if not out_dir_tpl:
             QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         tasks, _, errors = self.parse_concat_tasks()
         if errors:
             QMessageBox.warning(self, "提示", "\n".join(errors[:12]))
+            return
+        src_dir = ""
+        try:
+            if tasks and tasks[0].get("inputs"):
+                first = tasks[0]["inputs"][0]
+                src_dir = first if os.path.isdir(first) else os.path.dirname(first)
+        except Exception:
+            src_dir = ""
+        out_dir = render_path_template(out_dir_tpl, variables={"src_dir": src_dir})
+        if not out_dir:
+            QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         self.btn_run_concat.setEnabled(False)
         self.concat_prog.setValue(0)
@@ -17960,13 +18170,23 @@ class VideoConcatTab(QWidget):
         self.concat_thread.start()
 
     def run_scene_split(self):
-        out_dir = self.out_path_edit.text().strip().strip('"').strip("'")
-        if not out_dir:
+        out_dir_tpl = self.out_path_edit.text().strip().strip('"').strip("'")
+        if not out_dir_tpl:
             QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         videos = self._collect_videos()
         if not videos:
             QMessageBox.warning(self, "提示", "请先添加至少 1 个有效视频素材")
+            return
+        src_dir = ""
+        try:
+            first = videos[0]
+            src_dir = first if os.path.isdir(first) else os.path.dirname(first)
+        except Exception:
+            src_dir = ""
+        out_dir = render_path_template(out_dir_tpl, variables={"src_dir": src_dir})
+        if not out_dir:
+            QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         self.btn_run_split.setEnabled(False)
         self.split_prog.setValue(0)
@@ -17989,13 +18209,23 @@ class VideoConcatTab(QWidget):
         self.scene_thread.start()
 
     def run_speed(self):
-        out_dir = self.out_path_edit.text().strip().strip('"').strip("'")
-        if not out_dir:
+        out_dir_tpl = self.out_path_edit.text().strip().strip('"').strip("'")
+        if not out_dir_tpl:
             QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         videos = self._collect_videos()
         if not videos:
             QMessageBox.warning(self, "提示", "请先添加至少 1 个有效视频素材")
+            return
+        src_dir = ""
+        try:
+            first = videos[0]
+            src_dir = first if os.path.isdir(first) else os.path.dirname(first)
+        except Exception:
+            src_dir = ""
+        out_dir = render_path_template(out_dir_tpl, variables={"src_dir": src_dir})
+        if not out_dir:
+            QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         self.btn_run_speed.setEnabled(False)
         self.speed_prog.setValue(0)
@@ -18017,13 +18247,17 @@ class VideoConcatTab(QWidget):
         self.speed_thread.start()
 
     def run_trim(self):
-        out_dir = self.out_path_edit.text().strip().strip('"').strip("'")
-        if not out_dir:
+        out_dir_tpl = self.out_path_edit.text().strip().strip('"').strip("'")
+        if not out_dir_tpl:
             QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         src = self._trim_selected_video()
         if not src or not os.path.isfile(src):
             QMessageBox.warning(self, "提示", "请先选择一个有效视频")
+            return
+        out_dir = render_path_template(out_dir_tpl, variables={"src_dir": os.path.dirname(src)})
+        if not out_dir:
+            QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         start = float(self.trim_start_spin.value() or 0.0)
         end = float(self.trim_end_spin.value() or 0.0)
@@ -18058,13 +18292,23 @@ class VideoConcatTab(QWidget):
         self.trim_thread.start()
 
     def run_trim_batch(self):
-        out_dir = self.out_path_edit.text().strip().strip('"').strip("'")
-        if not out_dir:
+        out_dir_tpl = self.out_path_edit.text().strip().strip('"').strip("'")
+        if not out_dir_tpl:
             QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         tasks, errors = self._collect_trim_table_tasks()
         if errors:
             QMessageBox.warning(self, "提示", "\n".join(errors[:12]))
+            return
+        src_dir = ""
+        try:
+            if tasks and tasks[0].get("src"):
+                src_dir = os.path.dirname(tasks[0]["src"])
+        except Exception:
+            src_dir = ""
+        out_dir = render_path_template(out_dir_tpl, variables={"src_dir": src_dir})
+        if not out_dir:
+            QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         self.btn_run_trim.setEnabled(False)
         self.btn_run_trim_batch.setEnabled(False)
@@ -18112,13 +18356,23 @@ class VideoConcatTab(QWidget):
         super().keyPressEvent(event)
 
     def run_format_audio(self):
-        out_dir = self.out_path_edit.text().strip().strip('"').strip("'")
-        if not out_dir:
+        out_dir_tpl = self.out_path_edit.text().strip().strip('"').strip("'")
+        if not out_dir_tpl:
             QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         videos = self._collect_videos()
         if not videos:
             QMessageBox.warning(self, "提示", "请先添加至少 1 个有效视频素材")
+            return
+        src_dir = ""
+        try:
+            first = videos[0]
+            src_dir = first if os.path.isdir(first) else os.path.dirname(first)
+        except Exception:
+            src_dir = ""
+        out_dir = render_path_template(out_dir_tpl, variables={"src_dir": src_dir})
+        if not out_dir:
+            QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
         enable_aspect = self.format_enable_aspect_check.isChecked() if hasattr(self, "format_enable_aspect_check") else True
         enable_audio = self.format_enable_audio_check.isChecked() if hasattr(self, "format_enable_audio_check") else True
@@ -21177,6 +21431,7 @@ class FileManagerPro(QMainWindow):
         self.sorter_mode_combo.addItem("按扩展名自动分类", "extension")
         self.sorter_mode_combo.addItem("按时间自动分类", "time")
         self.sorter_mode_combo.addItem("提取子文件夹文件到指定目录", "flatten_to_root")
+        self.sorter_mode_combo.addItem("提取配对文件夹（完整/缺失/手动检查）", "extract_incomplete_pairs")
         mode_layout.addWidget(self.sorter_mode_combo, 1)
         layout.addLayout(mode_layout)
         self.sorter_mode_tip = QLabel("")
@@ -21249,6 +21504,39 @@ class FileManagerPro(QMainWindow):
         self.sorter_flatten_delete_empty_check.toggled.connect(self.trigger_save)
         sorter_flatten_layout.addWidget(self.sorter_flatten_delete_empty_check)
         layout.addWidget(self.sorter_flatten_box)
+
+        # ── 缺素材文件夹提取 ─────────────────────────────────────────────
+        self.sorter_incomplete_box = QWidget()
+        sorter_incomplete_layout = QVBoxLayout(self.sorter_incomplete_box)
+        sorter_incomplete_layout.setContentsMargins(0, 0, 0, 0)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("提取到:"))
+        self.sorter_incomplete_target_input = QLineEdit()
+        self.sorter_incomplete_target_input.setPlaceholderText("例如：配对提取结果  或  绝对路径目录")
+        self.sorter_incomplete_target_input.setToolTip("留空时默认创建“配对检查结果”；程序会在该目录下自动分成“完整”“缺失”“需手动检查”三个子目录。")
+        self.sorter_incomplete_target_input.textChanged.connect(self.trigger_save)
+        row1.addWidget(self.sorter_incomplete_target_input, 1)
+        sorter_incomplete_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.sorter_incomplete_keep_structure_check = QCheckBox("保持原结构（按相对路径）")
+        self.sorter_incomplete_keep_structure_check.setChecked(True)
+        self.sorter_incomplete_keep_structure_check.setToolTip("勾选后会按相对路径保留层级，例如 A/项目1 会提取到 目标/A/项目1；不勾选则只保留文件夹名（重名会自动加 (2)）。")
+        self.sorter_incomplete_keep_structure_check.toggled.connect(self.trigger_save)
+        row2.addWidget(self.sorter_incomplete_keep_structure_check)
+        self.sorter_incomplete_check_missing_txt_check = QCheckBox("同时检查缺文本（mp4 无同名 txt）")
+        self.sorter_incomplete_check_missing_txt_check.setChecked(False)
+        self.sorter_incomplete_check_missing_txt_check.setToolTip("默认只关心“有 1.txt 但没有 1.mp4”的缺素材情况；勾选后也会把“有 1.mp4 但没有 1.txt”视为不完整。")
+        self.sorter_incomplete_check_missing_txt_check.toggled.connect(self.trigger_save)
+        row2.addWidget(self.sorter_incomplete_check_missing_txt_check)
+        row2.addStretch()
+        sorter_incomplete_layout.addLayout(row2)
+
+        tip = QLabel("规则：只把“纯数字命名”的 `.txt` 与常见视频文件当作一对（如 1.txt + 1.mp4）。提取时会自动分成“完整”“缺失”“需手动检查”三类。像 `fsgs.txt`、`未匹配-xxx.mp4`、`重复[2].mp4` 这类非纯数字视频名，不会当成正式配对，但会触发“需手动检查”。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#64748b; padding:2px 0 2px 2px;")
+        sorter_incomplete_layout.addWidget(tip)
+        layout.addWidget(self.sorter_incomplete_box)
         self.sorter_mode_combo.currentIndexChanged.connect(self._on_sorter_mode_changed)
         self.sorter_mode_combo.currentIndexChanged.connect(self.trigger_save)
         self.sorter_time_basis_combo.currentIndexChanged.connect(self.trigger_save)
@@ -21284,6 +21572,7 @@ class FileManagerPro(QMainWindow):
 
     def create_heygen_project_ui(self, name, out_path="", src_path="", table_data=None, split_limit_value=None):
         project_widget = QWidget(); v_layout = QVBoxLayout(project_widget); # 素材来源
+        project_widget.setProperty("heygen_project_name", name)
         src_layout = QHBoxLayout()
         src_layout.addWidget(QLabel("素材来源目录:"))
         src_input = PathDropLineEdit(accept_dirs=True, accept_files=False)
@@ -21357,7 +21646,7 @@ class FileManagerPro(QMainWindow):
         
         # 核心改进：先将项目登记到 self.project_tabs，再填充数据和统计
         # 这样加载第一个项目时，update_global_total_count 就能找到它
-        self.project_tabs[name] = {"out_path": path_input, "source_input": src_input, "table": table, "move_check": None, "split_limit": split_limit}
+        self.project_tabs[name] = {"out_path": path_input, "source_input": src_input, "table": table, "move_check": None, "split_limit": split_limit, "widget": project_widget}
 
         if table_data:
             table.setRowCount(len(table_data))
@@ -21379,12 +21668,14 @@ class FileManagerPro(QMainWindow):
         btn_ai_match = QPushButton("🤖 AI 智能图文匹配")
         btn_ai_match.setToolTip("提供一批图片，让 AI 自动分析并匹配到最合适的文案行")
         btn_ai_match.setStyleSheet("QPushButton { background-color: #7c3aed; color: white; padding: 4px 10px; border-radius: 4px; } QPushButton:hover { background-color: #6d28d9; }")
-        def _run_ai_match_direct(checked=False, _n=name):
-            self.run_auto_match_for_project(_n)
+        def _current_project_name():
+            return self._get_heygen_project_name_by_widget(project_widget) or name
+        def _run_ai_match_direct(checked=False):
+            self.run_auto_match_for_project(_current_project_name())
         btn_ai_match.clicked.connect(_run_ai_match_direct)
         btn_layout.addWidget(btn_ai_match)
 
-        btn_layout.addStretch(); btn_run_single = QPushButton(f"🚀 仅整理 [{name}]"); btn_run_single.clicked.connect(lambda: self.run_single_heygen_project(name)); btn_layout.addWidget(btn_run_single); btn_csv_only = QPushButton(f"📊 仅导出CSV [{name}]"); btn_csv_only.clicked.connect(lambda: self.run_single_heygen_csv_only(name)); btn_layout.addWidget(btn_csv_only); btn_split_en = QPushButton(f"✂️ 导出分段英文 [{name}]"); btn_split_en.clicked.connect(lambda: self.run_single_heygen_split_en(name)); btn_layout.addWidget(btn_split_en); v_layout.addLayout(btn_layout); self.heygen_project_tabs.addTab(project_widget, name)
+        btn_layout.addStretch(); btn_run_single = QPushButton("🚀 仅整理当前项目"); btn_run_single.clicked.connect(lambda: self.run_single_heygen_project(_current_project_name())); btn_layout.addWidget(btn_run_single); btn_csv_only = QPushButton("📊 仅导出当前项目 CSV"); btn_csv_only.clicked.connect(lambda: self.run_single_heygen_csv_only(_current_project_name())); btn_layout.addWidget(btn_csv_only); btn_split_en = QPushButton("✂️ 导出当前项目分段英文"); btn_split_en.clicked.connect(lambda: self.run_single_heygen_split_en(_current_project_name())); btn_layout.addWidget(btn_split_en); v_layout.addLayout(btn_layout); self.heygen_project_tabs.addTab(project_widget, name)
         
         # 最后执行一次统计，此时项目已完全就绪
         _update_count()
@@ -22682,6 +22973,7 @@ class FileManagerPro(QMainWindow):
         cfg_row.addWidget(self.uni_subtitle_mode_combo)
         cfg_row.addSpacing(10)
         self.uni_match_split_subfolder_check = QCheckBox("每个子文件夹单独匹配")
+        self.uni_match_split_subfolder_check.setChecked(True)
         self.uni_match_split_subfolder_check.setToolTip("勾选后，会按相对同名子目录分别匹配；不同子文件夹之间不再共用文本，也不会把预览名称全局串号。")
         cfg_row.addWidget(self.uni_match_split_subfolder_check)
         self.uni_match_skip_existing_pairs_check = QCheckBox("已有成对文件跳过")
@@ -23082,10 +23374,18 @@ class FileManagerPro(QMainWindow):
                 rename_name="",
                 mode_override="general"
             ) or os.path.splitext(os.path.basename(m.get('src', '') or src_rel))[0]
-            seq = rename_name_counts.get(base_rename_name, 0) + 1
-            rename_name_counts[base_rename_name] = seq
-            rename_name = base_rename_name if seq == 1 else f"{base_rename_name}_{seq}"
             res_ext = os.path.splitext(str(m.get('res', '') or res_rel))[1]
+            # 命名去重应当“按目标所在文件夹”独立计数：
+            # 否则 A 文件夹里已经出现过 1.mp4，会导致 B 文件夹里第一个 1.mp4 直接变成 1_2.mp4（用户会觉得很怪）。
+            # 同时扩展名不同的文件允许同名（1.mp4 与 1.wav 不冲突）。
+            try:
+                res_dir_key = os.path.dirname(os.path.abspath(str(m.get('res', '') or ''))).lower()
+            except Exception:
+                res_dir_key = ""
+            count_key = (res_dir_key, str(base_rename_name or ""), str(res_ext or "").lower())
+            seq = rename_name_counts.get(count_key, 0) + 1
+            rename_name_counts[count_key] = seq
+            rename_name = base_rename_name if seq == 1 else f"{base_rename_name}_{seq}"
             display_name = f"{rename_name}{res_ext}" if rename_name and res_ext else (rename_name or src_rel)
             tooltip = f"来源：{src_rel}\n目标：{res_rel}"
             self._append_universal_match_row(display_name, res_rel, m.get('score', ''), src_abs=m.get('src', ''), res_abs=m.get('res', ''), rename_name=rename_name, tooltip=tooltip, srt_label="", srt_abs="", txt_label="", txt_abs="")
@@ -24881,7 +25181,8 @@ class FileManagerPro(QMainWindow):
         if not base:
             base = next((p for p in candidate_paths if os.path.isdir(p)), "") or ""
         if base:
-            return base
+            # 允许在口令里写“{date} / ${HOME} / ~”等变量
+            return render_path_template(base)
 
         # 约定俗成的“下载目录”
         def _downloads_dir():
@@ -25160,6 +25461,7 @@ class FileManagerPro(QMainWindow):
             "extension": "按扩展名自动分类",
             "time": "按时间自动分类",
             "flatten_to_root": "提取子文件夹文件到指定目录",
+            "extract_incomplete_pairs": "提取配对检查文件夹（完整/缺失/手动检查）",
         }
         return labels.get(mode, mode)
 
@@ -25176,6 +25478,8 @@ class FileManagerPro(QMainWindow):
             self.sorter_time_box.setVisible(mode == "time")
         if hasattr(self, "sorter_flatten_box") and is_alive(self.sorter_flatten_box):
             self.sorter_flatten_box.setVisible(mode == "flatten_to_root")
+        if hasattr(self, "sorter_incomplete_box") and is_alive(self.sorter_incomplete_box):
+            self.sorter_incomplete_box.setVisible(mode == "extract_incomplete_pairs")
         rule_hints = {
             "comprehensive": "可选规则优先级最高；未命中规则时，再尝试按文件名匹配现有文件夹、按文件名前缀自动分组，最后按扩展名兜底分类。",
             "custom_rule": "手动写规则：按“关键词 / 匹配模式 / 目标文件夹名”分类。目标文件夹名可填已存在目录，也可自动新建。",
@@ -25195,6 +25499,7 @@ class FileManagerPro(QMainWindow):
             "extension": "按文件后缀自动分类，可直接使用内置类型，也可用上方表格覆盖默认映射。",
             "time": f"按文件时间归档，当前设置：{time_basis_text}，{time_group_text}。",
             "flatten_to_root": "把子文件夹里的文件统一提取到你指定的新文件夹；可选提取后自动删除已清空的子文件夹。",
+            "extract_incomplete_pairs": "扫描子文件夹中的纯数字 txt/视频配对情况，并把“完整”“缺失”“需手动检查”自动分开提取到目标目录。",
         }
         if hasattr(self, "sorter_mode_tip") and is_alive(self.sorter_mode_tip):
             self.sorter_mode_tip.setText(tips.get(mode, ""))
@@ -25347,6 +25652,195 @@ class FileManagerPro(QMainWindow):
             return os.path.abspath(raw_target)
         folder_name = self._sanitize_sort_folder_name(raw_target, fallback="提取结果")
         return os.path.join(src_dir, folder_name or "提取结果")
+
+    def _resolve_incomplete_pairs_target_dir(self, src_dir):
+        """缺素材文件夹提取：目标目录（相对路径默认落在源目录下）。"""
+        src_dir = os.path.abspath(str(src_dir or "").strip())
+        raw_target = ""
+        if hasattr(self, "sorter_incomplete_target_input") and is_alive(self.sorter_incomplete_target_input):
+            raw_target = str(self.sorter_incomplete_target_input.text() or "").strip()
+        if not raw_target:
+            raw_target = "配对检查结果"
+        if os.path.isabs(raw_target):
+            return os.path.abspath(raw_target)
+        folder_name = self._sanitize_sort_folder_name(raw_target, fallback="配对检查结果")
+        return os.path.join(src_dir, folder_name or "配对检查结果")
+
+    def _resolve_pair_status_move_root(self, folder_path, src_dir, output_root=""):
+        """
+        若命中的配对子目录外层父目录本身还带有 csv/图片/表格等散文件，
+        则向上提升到那个“项目根目录”整体移动，避免只搬走最深层视频子目录。
+        """
+        src_dir = os.path.abspath(str(src_dir or "").strip())
+        current = os.path.abspath(str(folder_path or "").strip())
+        output_root = os.path.abspath(str(output_root or "").strip()) if output_root else ""
+        if not current or not os.path.isdir(current):
+            return folder_path
+        while True:
+            parent = os.path.dirname(current)
+            if not parent or parent == current:
+                break
+            parent_abs = os.path.abspath(parent)
+            if parent_abs == src_dir:
+                break
+            if output_root:
+                try:
+                    if os.path.commonpath([output_root, parent_abs]) == output_root:
+                        break
+                except Exception:
+                    pass
+            if self._is_sorter_auto_managed_dir(parent_abs):
+                break
+            try:
+                direct_files = [
+                    name for name in os.listdir(parent_abs)
+                    if os.path.isfile(os.path.join(parent_abs, name)) and name != SORTER_AUTO_DIR_MARKER
+                ]
+            except Exception:
+                break
+            if not direct_files:
+                break
+            current = parent_abs
+        return current
+
+    def _merge_pair_status_item(self, old_item, new_item):
+        priority = {"complete": 1, "incomplete": 2, "manual_review": 3}
+        if not old_item:
+            return dict(new_item or {})
+        merged = dict(old_item)
+        merged["missing_mp4"] = sorted(set((old_item.get("missing_mp4", []) or []) + (new_item.get("missing_mp4", []) or [])), key=lambda x: int(x) if str(x).isdigit() else str(x))
+        merged["missing_txt"] = sorted(set((old_item.get("missing_txt", []) or []) + (new_item.get("missing_txt", []) or [])), key=lambda x: int(x) if str(x).isdigit() else str(x))
+        merged["paired"] = sorted(set((old_item.get("paired", []) or []) + (new_item.get("paired", []) or [])), key=lambda x: int(x) if str(x).isdigit() else str(x))
+        merged["extra_videos"] = sorted(set((old_item.get("extra_videos", []) or []) + (new_item.get("extra_videos", []) or [])))
+        old_status = str(old_item.get("status", "") or "")
+        new_status = str(new_item.get("status", "") or "")
+        if priority.get(new_status, 0) >= priority.get(old_status, 0):
+            merged["status"] = new_status or old_status
+        return merged
+
+    def _normalize_pair_sort_rel_path(self, rel_path):
+        rel_path = str(rel_path or "").replace("\\", "/").strip().strip("/")
+        if not rel_path:
+            return ""
+        strip_heads = {"完整", "缺失", "需手动检查", "手动检查", "需检查", "配对检查结果", "其它文件"}
+        parts = [p for p in rel_path.split("/") if p]
+        while parts and parts[0] in strip_heads:
+            parts.pop(0)
+        return "/".join(parts)
+
+    def _collect_pair_status_folders(self, src_dir, recursive=True, check_missing_txt=False, output_root=""):
+        """
+        扫描数字 txt/视频配对目录，并区分：
+        - complete:      至少存在一组完整配对，且没有缺失，也没有额外未编号视频
+        - incomplete:    有缺失配对，但没有明显需要人工补判的额外视频
+        - manual_review: 存在额外未编号视频（如 未匹配-xxx、重复[...]、原始文件名视频），建议人工复核
+        返回：{"incomplete":[...], "complete":[...], "manual_review":[...]}
+        """
+        src_dir = os.path.abspath(str(src_dir or "").strip())
+        output_root = os.path.abspath(str(output_root or "").strip()) if output_root else ""
+        results = {"incomplete": [], "complete": [], "manual_review": []}
+        if not src_dir or not os.path.isdir(src_dir):
+            return results
+        num_re = re.compile(r"^\d+$")
+        video_exts = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv", ".flv", ".webm", ".ts", ".mts", ".m2ts"}
+        merged_by_path = {}
+        try:
+            for root, dirs, files in os.walk(src_dir):
+                root_abs = os.path.abspath(root)
+                if root_abs == src_dir:
+                    dirs[:] = self._filter_sort_subdirs(root, dirs, src_dir)
+                    continue
+
+                dirs[:] = self._filter_sort_subdirs(root, dirs, src_dir)
+                if not recursive:
+                    dirs[:] = []
+                if output_root:
+                    try:
+                        if os.path.commonpath([output_root, root_abs]) == output_root:
+                            continue
+                    except Exception:
+                        pass
+
+                txt_nums = set()
+                video_nums = set()
+                extra_videos = []
+                for fname in files or []:
+                    stem, ext = os.path.splitext(str(fname or ""))
+                    ext = ext.lower().strip()
+                    if ext not in ({".txt"} | video_exts):
+                        continue
+                    stem = str(stem or "").strip()
+                    if not stem:
+                        continue
+                    if ext == ".txt":
+                        if not num_re.fullmatch(stem):
+                            continue
+                        txt_nums.add(stem)
+                    else:
+                        if num_re.fullmatch(stem):
+                            video_nums.add(stem)
+                        else:
+                            extra_videos.append(str(fname or ""))
+
+                paired_nums = sorted(list(txt_nums & video_nums), key=lambda x: int(x))
+                missing_mp4 = sorted(list(txt_nums - video_nums), key=lambda x: int(x))
+                missing_txt = sorted(list(video_nums - txt_nums), key=lambda x: int(x)) if check_missing_txt else []
+                manual_trigger = bool(extra_videos) and bool(txt_nums)
+                if manual_trigger:
+                    item = {
+                        "path": self._resolve_pair_status_move_root(root_abs, src_dir, output_root),
+                        "missing_mp4": missing_mp4,
+                        "missing_txt": missing_txt,
+                        "paired": paired_nums,
+                        "extra_videos": sorted(extra_videos),
+                        "status": "manual_review",
+                    }
+                    merged_by_path[item["path"]] = self._merge_pair_status_item(merged_by_path.get(item["path"]), item)
+                    dirs[:] = []
+                elif missing_mp4 or missing_txt:
+                    item = {
+                        "path": self._resolve_pair_status_move_root(root_abs, src_dir, output_root),
+                        "missing_mp4": missing_mp4,
+                        "missing_txt": missing_txt,
+                        "paired": paired_nums,
+                        "extra_videos": [],
+                        "status": "incomplete",
+                    }
+                    merged_by_path[item["path"]] = self._merge_pair_status_item(merged_by_path.get(item["path"]), item)
+                    dirs[:] = []
+                elif paired_nums:
+                    item = {
+                        "path": self._resolve_pair_status_move_root(root_abs, src_dir, output_root),
+                        "missing_mp4": [],
+                        "missing_txt": [],
+                        "paired": paired_nums,
+                        "extra_videos": [],
+                        "status": "complete",
+                    }
+                    merged_by_path[item["path"]] = self._merge_pair_status_item(merged_by_path.get(item["path"]), item)
+                    dirs[:] = []
+        except Exception:
+            return {"incomplete": [], "complete": [], "manual_review": []}
+        for item in merged_by_path.values():
+            status = str(item.get("status", "") or "")
+            if status in results:
+                results[status].append(item)
+        return results
+
+    def _collect_incomplete_pairs_folders(self, src_dir, recursive=True, check_missing_txt=False, output_root=""):
+        """
+        扫描“缺素材文件夹”：
+        - 只认纯数字文件名：1.txt / 1.mp4
+        - 默认只检查：txt 有而 mp4 缺（缺视频素材）
+        - 可选：也检查 mp4 有而 txt 缺
+        返回：[{path, missing_mp4:[...], missing_txt:[...]}]
+        """
+        return self._collect_pair_status_folders(
+            src_dir,
+            recursive=recursive,
+            check_missing_txt=check_missing_txt,
+            output_root=output_root,
+        ).get("incomplete", [])
 
     def _remove_empty_sort_dirs(self, src_dir, keep_dirs=None):
         src_dir = os.path.abspath(str(src_dir or "").strip())
@@ -26872,32 +27366,7 @@ class FileManagerPro(QMainWindow):
         - {yyyyMMdd}: 例如 20260729
         - {project}: 当前项目名（会做安全化）
         """
-        raw = str(path_template or "").strip()
-        if not raw:
-            return ""
-        try:
-            from datetime import datetime as _dt
-            now = _dt.now()
-            mapping = {
-                "{date}": now.strftime("%Y-%m-%d"),
-                "{yyyy-MM-dd}": now.strftime("%Y-%m-%d"),
-                "{yyyyMMdd}": now.strftime("%Y%m%d"),
-                "{project}": clean_long_filename(str(project_name or ""), 120) if project_name else "",
-            }
-        except Exception:
-            mapping = {}
-        # 展开环境变量与 ~
-        try:
-            raw = os.path.expandvars(os.path.expanduser(raw))
-        except Exception:
-            pass
-        for k, v in mapping.items():
-            if k in raw:
-                raw = raw.replace(k, v)
-        try:
-            return os.path.normpath(raw)
-        except Exception:
-            return raw
+        return render_path_template(path_template, project_name=project_name)
 
     def _get_heygen_base_output_dir(self, project_name="", project_entry=None):
         """
@@ -26937,6 +27406,46 @@ class FileManagerPro(QMainWindow):
         name = self.new_proj_input.text().strip()
         if not name or name in self.project_tabs: return
         self.create_heygen_project_ui(name); self.new_proj_input.clear(); self.trigger_save()
+    def _get_heygen_project_name_by_widget(self, project_widget):
+        if not hasattr(self, "heygen_project_tabs") or not is_alive(self.heygen_project_tabs) or not project_widget:
+            return ""
+        try:
+            for i in range(self.heygen_project_tabs.count()):
+                if self.heygen_project_tabs.widget(i) is project_widget:
+                    return self.heygen_project_tabs.tabText(i)
+        except Exception:
+            pass
+        try:
+            return str(project_widget.property("heygen_project_name") or "").strip()
+        except Exception:
+            return ""
+    def rename_current_heygen_project(self):
+        idx = self.heygen_project_tabs.currentIndex() if hasattr(self, "heygen_project_tabs") else -1
+        if idx < 0:
+            return
+        old_name = self.heygen_project_tabs.tabText(idx).strip()
+        if not old_name:
+            return
+        new_name, ok = QInputDialog.getText(self, "重命名项目", "请输入新的项目名：", text=old_name)
+        new_name = str(new_name or "").strip()
+        if not ok or not new_name or new_name == old_name:
+            return
+        if new_name in self.project_tabs:
+            QMessageBox.warning(self, "提示", f"项目名 [{new_name}] 已存在，请换一个名称。")
+            return
+        project_data = self.project_tabs.get(old_name)
+        if not project_data:
+            return
+        self.project_tabs[new_name] = self.project_tabs.pop(old_name)
+        project_widget = self.heygen_project_tabs.widget(idx)
+        try:
+            if project_widget:
+                project_widget.setProperty("heygen_project_name", new_name)
+        except Exception:
+            pass
+        self.heygen_project_tabs.setTabText(idx, new_name)
+        self.log(f"项目 [{old_name}] 已重命名为 [{new_name}]", "green")
+        self.trigger_save()
     def delete_current_heygen_project(self):
         idx = self.heygen_project_tabs.currentIndex()
         if idx < 0: return
@@ -27752,6 +28261,183 @@ class FileManagerPro(QMainWindow):
                         pass
             else:
                 self.log(f"当前模式【{self._get_sorter_mode_label(mode)}】下未发现可移动的文件", "orange")
+            return
+        if mode == "extract_incomplete_pairs":
+            recursive = self.recursive_check.isChecked() if hasattr(self, "recursive_check") and is_alive(self.recursive_check) else False
+            keep_structure = self.sorter_incomplete_keep_structure_check.isChecked() if hasattr(self, "sorter_incomplete_keep_structure_check") and is_alive(self.sorter_incomplete_keep_structure_check) else True
+            check_missing_txt = self.sorter_incomplete_check_missing_txt_check.isChecked() if hasattr(self, "sorter_incomplete_check_missing_txt_check") and is_alive(self.sorter_incomplete_check_missing_txt_check) else False
+            target_dir = self._resolve_incomplete_pairs_target_dir(src_dir)
+            pair_groups = self._collect_pair_status_folders(
+                src_dir,
+                recursive=recursive,
+                check_missing_txt=check_missing_txt,
+                output_root=target_dir,
+            )
+            incomplete_items = pair_groups.get("incomplete", []) or []
+            complete_items = pair_groups.get("complete", []) or []
+            manual_review_items = pair_groups.get("manual_review", []) or []
+            if not incomplete_items and not complete_items and not manual_review_items:
+                self.log(f"当前模式【{self._get_sorter_mode_label(mode)}】下没有发现可提取的配对文件夹", "orange")
+                return
+
+            # 预览提示：展示前若干项
+            preview_lines = []
+            preview_items = (
+                [dict(it, _preview_status="缺失") for it in incomplete_items[:6]]
+                + [dict(it, _preview_status="手动检查") for it in manual_review_items[:6]]
+                + [dict(it, _preview_status="完整") for it in complete_items[:6]]
+            )
+            for it in preview_items:
+                rel = ""
+                try:
+                    rel = os.path.relpath(it.get("path", ""), src_dir)
+                except Exception:
+                    rel = os.path.basename(it.get("path", "") or "")
+                m_mp4 = it.get("missing_mp4", []) or []
+                m_txt = it.get("missing_txt", []) or []
+                extra_videos = it.get("extra_videos", []) or []
+                note_parts = []
+                if m_mp4:
+                    note_parts.append(f"缺视频:{','.join(m_mp4[:8])}{'...' if len(m_mp4) > 8 else ''}")
+                if m_txt:
+                    note_parts.append(f"缺文本:{','.join(m_txt[:8])}{'...' if len(m_txt) > 8 else ''}")
+                if extra_videos:
+                    note_parts.append(f"额外视频:{','.join(extra_videos[:4])}{'...' if len(extra_videos) > 4 else ''}")
+                if not note_parts:
+                    paired = it.get("paired", []) or []
+                    note_parts.append(f"完整配对:{len(paired)} 组")
+                preview_lines.append(f"- [{it.get('_preview_status', '缺失')}] {rel}（{'；'.join(note_parts)}）")
+            total_items = len(incomplete_items) + len(complete_items) + len(manual_review_items)
+            more_hint = f"\n... 还有 {total_items - len(preview_items)} 个未展示" if total_items > len(preview_items) else ""
+            scope_text = "所有层级子文件夹" if recursive else "直接子文件夹"
+            keep_text = "保持原结构" if keep_structure else "仅保留文件夹名"
+            incomplete_dir = os.path.join(target_dir, "缺失")
+            manual_review_dir = os.path.join(target_dir, "需手动检查")
+            complete_dir = os.path.join(target_dir, "完整")
+            confirm = QMessageBox.question(
+                self,
+                "确认提取配对文件夹",
+                f"将从{scope_text}中整理 {total_items} 个文件夹：\n"
+                f"- 缺失：{len(incomplete_items)} 个 → {incomplete_dir}\n"
+                f"- 需手动检查：{len(manual_review_items)} 个 → {manual_review_dir}\n"
+                f"- 完整：{len(complete_items)} 个 → {complete_dir}\n\n方式：{keep_text}\n\n示例：\n"
+                + "\n".join(preview_lines)
+                + more_hint
+                + "\n\n会把命中的原项目文件夹整体搬走，文件夹里的 csv、图片、表格等文件会跟着一起移动；最终只保留“完整 / 缺失 / 需手动检查”三个结果目录。\n\n是否继续？"
+            )
+            accepted_yes = QMessageBox.StandardButton.Yes if PYQT_VERSION == 6 else QMessageBox.Yes
+            if confirm != accepted_yes:
+                self.log("已取消提取配对文件夹。", "orange")
+                return
+
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                if incomplete_items:
+                    os.makedirs(incomplete_dir, exist_ok=True)
+                if manual_review_items:
+                    os.makedirs(manual_review_dir, exist_ok=True)
+                if complete_items:
+                    os.makedirs(complete_dir, exist_ok=True)
+                try:
+                    self._mark_sorter_auto_managed_dir(target_dir)
+                    if incomplete_items:
+                        self._mark_sorter_auto_managed_dir(incomplete_dir)
+                    if manual_review_items:
+                        self._mark_sorter_auto_managed_dir(manual_review_dir)
+                    if complete_items:
+                        self._mark_sorter_auto_managed_dir(complete_dir)
+                except Exception:
+                    pass
+            except Exception as e:
+                QMessageBox.warning(self, "提示", f"无法创建目标目录：\n{target_dir}\n\n{e}")
+                return
+
+            count = 0
+            history = []
+            failures = []
+            skipped = 0
+            moved_incomplete = 0
+            moved_manual_review = 0
+            moved_complete = 0
+            for status_key, bucket_dir, items in (
+                ("缺失", incomplete_dir, incomplete_items),
+                ("手动检查", manual_review_dir, manual_review_items),
+                ("完整", complete_dir, complete_items),
+            ):
+                for it in items:
+                    folder_path = os.path.abspath(it.get("path", "") or "")
+                    if not folder_path or not os.path.isdir(folder_path):
+                        continue
+                    try:
+                        # 防止把“输出目录”本身/其上级目录再次搬走导致递归错乱
+                        if target_dir and os.path.commonpath([folder_path, target_dir]) == folder_path:
+                            skipped += 1
+                            continue
+                        # 如果目标桶目录在源目录里，避免把桶目录搬走
+                        if os.path.commonpath([folder_path, bucket_dir]) == folder_path:
+                            skipped += 1
+                            continue
+                    except Exception:
+                        pass
+
+                    try:
+                        rel = os.path.relpath(folder_path, src_dir) if keep_structure else os.path.basename(folder_path)
+                    except Exception:
+                        rel = os.path.basename(folder_path)
+                    rel = self._normalize_pair_sort_rel_path(rel)
+                    rel = rel.strip().lstrip("\\/") if rel else os.path.basename(folder_path)
+                    target_path = os.path.join(bucket_dir, rel)
+                    try:
+                        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    except Exception:
+                        pass
+                    target_path = _pick_nonconflict_path(target_path)
+                    try:
+                        shutil.move(folder_path, target_path)
+                        history.append((folder_path, target_path))
+                        count += 1
+                        if status_key == "缺失":
+                            moved_incomplete += 1
+                        elif status_key == "手动检查":
+                            moved_manual_review += 1
+                        else:
+                            moved_complete += 1
+                    except Exception as e:
+                        failures.append((folder_path, target_path, f"{status_key}: {e}"))
+
+            removed_empty_dirs = []
+            # 关键：移动完“配对文件夹”后，把源目录里因此产生的空父级目录也清掉，避免残留空壳文件夹
+            if count > 0:
+                try:
+                    removed_empty_dirs = self._remove_empty_sort_dirs(
+                        src_dir,
+                        keep_dirs=[target_dir, incomplete_dir, manual_review_dir, complete_dir],
+                    )
+                except Exception:
+                    removed_empty_dirs = []
+
+            if count > 0:
+                self.last_sort_history = history
+                self.btn_undo_sort.setEnabled(True)
+                detail_parts = [f"提取文件夹 {count}", f"缺失 {moved_incomplete}", f"手动检查 {moved_manual_review}", f"完整 {moved_complete}"]
+                if skipped:
+                    detail_parts.append(f"跳过 {skipped}")
+                if removed_empty_dirs:
+                    detail_parts.append(f"删除空文件夹 {len(removed_empty_dirs)}")
+                self.log(f"分类完成，模式：{self._get_sorter_mode_label(mode)}（{'，'.join(detail_parts)}）", "green")
+                if failures:
+                    self.log(f"⚠️ 另有 {len(failures)} 个项目移动失败（常见原因：文件被占用/无权限）。", "orange")
+                    msg_lines = ["以下项目未能移动（常见原因：文件被占用/无权限）。请先关闭占用程序后重试："]
+                    for fp, tp, err in failures[:10]:
+                        msg_lines.append(f"- {os.path.basename(fp)}")
+                    if len(failures) > 10:
+                        msg_lines.append(f"... 还有 {len(failures) - 10} 个未展示")
+                    try:
+                        QMessageBox.warning(self, "部分项目未移动", "\n".join(msg_lines))
+                    except Exception:
+                        pass
+            else:
+                self.log(f"当前模式【{self._get_sorter_mode_label(mode)}】下未发现可移动的文件夹", "orange")
             return
         rules = self._collect_sorter_rules()
         if mode == "custom_rule" and not rules:
@@ -29078,6 +29764,12 @@ class FileManagerPro(QMainWindow):
                 self.sorter_flatten_target_input.setText(str(cfg.get("sorter_flatten_target", "") or ""))
             if hasattr(self, "sorter_flatten_delete_empty_check") and is_alive(self.sorter_flatten_delete_empty_check):
                 self.sorter_flatten_delete_empty_check.setChecked(bool(cfg.get("sorter_flatten_delete_empty", True)))
+            if hasattr(self, "sorter_incomplete_target_input") and is_alive(self.sorter_incomplete_target_input):
+                self.sorter_incomplete_target_input.setText(str(cfg.get("sorter_incomplete_target", "") or ""))
+            if hasattr(self, "sorter_incomplete_keep_structure_check") and is_alive(self.sorter_incomplete_keep_structure_check):
+                self.sorter_incomplete_keep_structure_check.setChecked(bool(cfg.get("sorter_incomplete_keep_structure", True)))
+            if hasattr(self, "sorter_incomplete_check_missing_txt_check") and is_alive(self.sorter_incomplete_check_missing_txt_check):
+                self.sorter_incomplete_check_missing_txt_check.setChecked(bool(cfg.get("sorter_incomplete_check_missing_txt", False)))
             if hasattr(self, "_on_sorter_mode_changed"):
                 self._on_sorter_mode_changed()
             if hasattr(self, "heygen_auto_split_en_check") and is_alive(self.heygen_auto_split_en_check):
@@ -29317,6 +30009,9 @@ class FileManagerPro(QMainWindow):
                 "sorter_time_granularity": self.sorter_time_group_combo.currentData() if hasattr(self, "sorter_time_group_combo") and is_alive(self.sorter_time_group_combo) else "month",
                 "sorter_flatten_target": self.sorter_flatten_target_input.text().strip() if hasattr(self, "sorter_flatten_target_input") and is_alive(self.sorter_flatten_target_input) else "",
                 "sorter_flatten_delete_empty": self.sorter_flatten_delete_empty_check.isChecked() if hasattr(self, "sorter_flatten_delete_empty_check") and is_alive(self.sorter_flatten_delete_empty_check) else True,
+                "sorter_incomplete_target": self.sorter_incomplete_target_input.text().strip() if hasattr(self, "sorter_incomplete_target_input") and is_alive(self.sorter_incomplete_target_input) else "",
+                "sorter_incomplete_keep_structure": self.sorter_incomplete_keep_structure_check.isChecked() if hasattr(self, "sorter_incomplete_keep_structure_check") and is_alive(self.sorter_incomplete_keep_structure_check) else True,
+                "sorter_incomplete_check_missing_txt": self.sorter_incomplete_check_missing_txt_check.isChecked() if hasattr(self, "sorter_incomplete_check_missing_txt_check") and is_alive(self.sorter_incomplete_check_missing_txt_check) else False,
                 "sorter_name_folder_enabled": self.sorter_name_folder_check.isChecked() if hasattr(self, "sorter_name_folder_check") and is_alive(self.sorter_name_folder_check) else True,
                 "sorter_filename_group_enabled": self.sorter_filename_group_check.isChecked() if hasattr(self, "sorter_filename_group_check") and is_alive(self.sorter_filename_group_check) else True,
                 "note_projects": note_projects,
@@ -29898,6 +30593,9 @@ class FileManagerPro(QMainWindow):
         btn_add = QPushButton("➕ 添加项目")
         btn_add.clicked.connect(self.add_heygen_project)
         manage_layout.addWidget(btn_add)
+        btn_rename = QPushButton("✏️ 重命名当前项目")
+        btn_rename.clicked.connect(self.rename_current_heygen_project)
+        manage_layout.addWidget(btn_rename)
         btn_del = QPushButton("❌ 删除当前项目")
         btn_del.clicked.connect(self.delete_current_heygen_project)
         manage_layout.addWidget(btn_del)
@@ -29921,6 +30619,7 @@ class FileManagerPro(QMainWindow):
         # 核心改进：开启标签页拖拽排序功能
         self.heygen_project_tabs.setMovable(True)
         self.heygen_project_tabs.tabCloseRequested.connect(self.close_heygen_project)
+        self.heygen_project_tabs.tabBarDoubleClicked.connect(lambda index: self.rename_current_heygen_project() if index >= 0 else None)
         self.heygen_project_tabs.tabBar().tabMoved.connect(lambda: self.trigger_save())
         layout.addWidget(self.heygen_project_tabs)
 
