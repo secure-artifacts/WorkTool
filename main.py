@@ -21471,6 +21471,14 @@ class FileManagerPro(QMainWindow):
             self.trigger_save()
         btn_del_sorter_row.clicked.connect(_sorter_del_row)
         row_btn_layout.addWidget(btn_del_sorter_row)
+        self.btn_sorter_import_heygen_names = QPushButton("⬇️ 获取素材整理命名")
+        self.btn_sorter_import_heygen_names.setToolTip("一键读取“素材整理与汇总”里已填写的项目名，以及可用的代码名，自动追加到当前分类规则中。会自动跳过纯数字代码和冲突关键词。")
+        self.btn_sorter_import_heygen_names.clicked.connect(self.import_sorter_rules_from_heygen)
+        row_btn_layout.addWidget(self.btn_sorter_import_heygen_names)
+        self.btn_sorter_clear_rules = QPushButton("🧹 清空规则")
+        self.btn_sorter_clear_rules.setToolTip("清空当前规则区（仅清空规则，不会影响你的源目录与其他设置）。如果刚刚导入了一批命名但想重新来一次，可以点这个。")
+        self.btn_sorter_clear_rules.clicked.connect(self.clear_sorter_rules)
+        row_btn_layout.addWidget(self.btn_sorter_clear_rules)
         row_btn_layout.addStretch()
         sorter_rule_box_layout.addLayout(row_btn_layout)
         layout.addWidget(self.sorter_rule_box)
@@ -21532,7 +21540,7 @@ class FileManagerPro(QMainWindow):
         row2.addStretch()
         sorter_incomplete_layout.addLayout(row2)
 
-        tip = QLabel("规则：只把“纯数字命名”的 `.txt` 与常见视频文件当作一对（如 1.txt + 1.mp4）。提取时会自动分成“完整”“缺失”“需手动检查”三类。像 `fsgs.txt`、`未匹配-xxx.mp4`、`重复[2].mp4` 这类非纯数字视频名，不会当成正式配对，但会触发“需手动检查”。")
+        tip = QLabel("规则：只把“纯数字命名”的 `.txt` 与常见视频文件当作一对（如 1.txt + 1.mp4）。提取时会自动分成“完整”“缺失”“需手动检查”三类。像 `未匹配-xxx.mp4`、`重复[2].mp4` 这类非纯数字视频名不算正式配对：如果存在缺失编号视频但视频总数足够（可能用多余视频补齐），会归入“需手动检查”；若视频总数仍不足，则归入“缺失”。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#64748b; padding:2px 0 2px 2px;")
         sorter_incomplete_layout.addWidget(tip)
@@ -25465,6 +25473,191 @@ class FileManagerPro(QMainWindow):
         }
         return labels.get(mode, mode)
 
+    def _build_sorter_rules_from_heygen_projects(self):
+        project_tabs = getattr(self, "project_tabs", {})
+        if not isinstance(project_tabs, dict) or not project_tabs:
+            return [], {"project_rule_count": 0, "code_rule_count": 0, "skipped_numeric_code_count": 0, "conflict_keywords": []}
+
+        ordered_names = []
+        if hasattr(self, "heygen_project_tabs") and is_alive(self.heygen_project_tabs):
+            try:
+                for i in range(self.heygen_project_tabs.count()):
+                    name = str(self.heygen_project_tabs.tabText(i) or "").strip()
+                    if name and name in project_tabs and name not in ordered_names:
+                        ordered_names.append(name)
+            except Exception:
+                pass
+        for name in list(project_tabs.keys()):
+            pname = str(name or "").strip()
+            if pname and pname not in ordered_names:
+                ordered_names.append(pname)
+
+        grouped = {}
+        skipped_numeric_code_count = 0
+
+        def _add_keyword(keyword, folder, source):
+            keyword = str(keyword or "").strip()
+            folder = self._sanitize_sort_folder_name(folder, fallback="")
+            source = str(source or "").strip() or "code"
+            if not keyword or not folder:
+                return
+            grouped.setdefault(keyword, [])
+            key = (folder, source)
+            if key in {(item.get("folder", ""), item.get("source", "")) for item in grouped[keyword]}:
+                return
+            grouped[keyword].append({"folder": folder, "source": source})
+
+        for project_name in ordered_names:
+            project_entry = project_tabs.get(project_name) or {}
+            folder_name = self._sanitize_sort_folder_name(project_name, fallback="")
+            if not folder_name:
+                continue
+            _add_keyword(project_name, folder_name, "project")
+
+            table = project_entry.get("table")
+            if not table or not is_alive(table):
+                continue
+            seen_codes_in_project = set()
+            for row in range(table.rowCount()):
+                code_item = table.item(row, 0)
+                code_text = code_item.text().strip() if code_item and code_item.text() else ""
+                if not code_text or code_text in seen_codes_in_project:
+                    continue
+                seen_codes_in_project.add(code_text)
+                compact_code = re.sub(r"[\s._-]+", "", code_text)
+                if compact_code.isdigit():
+                    skipped_numeric_code_count += 1
+                    continue
+                _add_keyword(code_text, folder_name, "code")
+
+        rules = []
+        project_rule_count = 0
+        code_rule_count = 0
+        conflict_keywords = []
+        for keyword, entries in grouped.items():
+            folders = {str(item.get("folder", "") or "").strip() for item in entries if str(item.get("folder", "") or "").strip()}
+            if not folders:
+                continue
+            chosen = None
+            if len(folders) == 1:
+                project_entries = [item for item in entries if item.get("source") == "project"]
+                chosen = project_entries[0] if project_entries else entries[0]
+            else:
+                project_entries = [item for item in entries if item.get("source") == "project"]
+                project_folders = {str(item.get("folder", "") or "").strip() for item in project_entries if str(item.get("folder", "") or "").strip()}
+                if len(project_folders) == 1 and project_entries:
+                    chosen = project_entries[0]
+                else:
+                    conflict_keywords.append({"keyword": keyword, "folders": sorted(folders)})
+                    continue
+
+            folder_name = str(chosen.get("folder", "") or "").strip()
+            if not folder_name:
+                continue
+            rules.append({"p": keyword, "m": "开头是", "f": folder_name})
+            if chosen.get("source") == "project":
+                project_rule_count += 1
+            else:
+                code_rule_count += 1
+
+        return rules, {
+            "project_rule_count": project_rule_count,
+            "code_rule_count": code_rule_count,
+            "skipped_numeric_code_count": skipped_numeric_code_count,
+            "conflict_keywords": conflict_keywords,
+        }
+
+    def import_sorter_rules_from_heygen(self):
+        rules, stats = self._build_sorter_rules_from_heygen_projects()
+        if not rules:
+            msg = "素材整理模块里暂时没有可导入的项目名/代码名。请先填写项目，代码列若是纯数字会被自动跳过。"
+            self.log(msg, "orange")
+            QMessageBox.information(self, "提示", msg)
+            return
+
+        if self._get_sorter_mode() == "extension" and hasattr(self, "sorter_mode_combo") and is_alive(self.sorter_mode_combo):
+            idx = self.sorter_mode_combo.findData("custom_rule")
+            if idx >= 0:
+                self.sorter_mode_combo.setCurrentIndex(idx)
+
+        added = self._append_sorter_rules(rules, bucket="rule")
+        existed_count = max(0, len(rules) - int(added or 0))
+        conflict_keywords = stats.get("conflict_keywords", []) or []
+
+        detail_parts = []
+        if stats.get("project_rule_count"):
+            detail_parts.append(f"项目名 {int(stats.get('project_rule_count', 0))} 条")
+        if stats.get("code_rule_count"):
+            detail_parts.append(f"代码名 {int(stats.get('code_rule_count', 0))} 条")
+        if stats.get("skipped_numeric_code_count"):
+            detail_parts.append(f"跳过纯数字代码 {int(stats.get('skipped_numeric_code_count', 0))} 条")
+        if conflict_keywords:
+            detail_parts.append(f"跳过冲突关键词 {len(conflict_keywords)} 组")
+        if existed_count:
+            detail_parts.append(f"已存在未重复追加 {existed_count} 条")
+        detail_text = "；".join(detail_parts)
+
+        if added:
+            msg = f"已从素材整理导入 {added} 条分类规则。"
+            if detail_text:
+                msg += f"\n\n{detail_text}"
+            if conflict_keywords:
+                preview_lines = [f"- {item.get('keyword', '')} => {' / '.join(item.get('folders', []))}" for item in conflict_keywords[:8]]
+                if preview_lines:
+                    msg += "\n\n以下关键词因会指向多个目标文件夹，已自动跳过：\n" + "\n".join(preview_lines)
+                if len(conflict_keywords) > 8:
+                    msg += f"\n... 还有 {len(conflict_keywords) - 8} 组未展开"
+            self.log(f"已从素材整理导入 {added} 条分类规则", "green")
+            QMessageBox.information(self, "导入完成", msg)
+            return
+
+        msg = "素材整理里的可导入规则都已经在当前分类规则里了，无需重复追加。"
+        if detail_text:
+            msg += f"\n\n{detail_text}"
+        self.log("素材整理命名已存在于当前分类规则中，无需重复导入。", "blue")
+        QMessageBox.information(self, "提示", msg)
+
+    def clear_sorter_rules(self):
+        """
+        清空当前规则区：
+        - 综合智能/自定义规则：清空“关键词规则”
+        - 扩展名模式：清空“扩展名映射”
+        """
+        mode = self._get_sorter_mode()
+        bucket = self._get_sorter_rule_bucket(mode)
+        if bucket not in ("rule", "extension"):
+            msg = "当前模式没有可清空的规则区。请切到“自定义规则模式/综合智能模式/按扩展名自动分类”后再清空。"
+            self.log(msg, "orange")
+            QMessageBox.information(self, "提示", msg)
+            return
+
+        label = "关键词规则" if bucket == "rule" else "扩展名映射"
+        reply = QMessageBox.question(
+            self,
+            "确认清空",
+            f"确定要清空当前【{label}】吗？\n此操作会清空规则表格与已保存的规则缓存（下次启动也不会再出现）。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 先同步一下，保证“清空”前的编辑不会造成怪异状态
+        try:
+            self._sync_sorter_rule_cache_from_table(mode)
+        except Exception:
+            pass
+
+        if not hasattr(self, "_sorter_rules_cache") or not isinstance(self._sorter_rules_cache, dict):
+            self._sorter_rules_cache = {"rule": [], "extension": []}
+        self._sorter_rules_cache[bucket] = []
+
+        # 若当前展示的就是这个 bucket，立即刷新表格为默认空行
+        if self._get_sorter_rule_bucket(self._get_sorter_mode()) == bucket:
+            self._apply_sorter_rules_to_table([])
+        self.trigger_save()
+        self.log(f"已清空 {label}", "blue")
+
     def _on_sorter_mode_changed(self, *args):
         mode = self._get_sorter_mode()
         prev_mode = str(getattr(self, "_sorter_rule_mode_state", "") or "").strip()
@@ -25487,6 +25680,10 @@ class FileManagerPro(QMainWindow):
         }
         if hasattr(self, "sorter_rule_hint") and is_alive(self.sorter_rule_hint):
             self.sorter_rule_hint.setText(rule_hints.get(mode, ""))
+        if hasattr(self, "btn_sorter_import_heygen_names") and is_alive(self.btn_sorter_import_heygen_names):
+            self.btn_sorter_import_heygen_names.setVisible(mode in ("comprehensive", "custom_rule"))
+        if hasattr(self, "btn_sorter_clear_rules") and is_alive(self.btn_sorter_clear_rules):
+            self.btn_sorter_clear_rules.setVisible(mode in ("comprehensive", "custom_rule", "extension"))
         if show_rule_box:
             self._apply_sorter_rules_to_table(self._get_sorter_cached_rules(mode))
         time_basis_text = self.sorter_time_basis_combo.currentText() if hasattr(self, "sorter_time_basis_combo") and is_alive(self.sorter_time_basis_combo) else "按修改时间"
@@ -25654,53 +25851,67 @@ class FileManagerPro(QMainWindow):
         return os.path.join(src_dir, folder_name or "提取结果")
 
     def _resolve_incomplete_pairs_target_dir(self, src_dir):
-        """缺素材文件夹提取：目标目录（相对路径默认落在源目录下）。"""
+        """缺素材文件夹提取：自动避免重复套娃，只保留一层结果目录。"""
         src_dir = os.path.abspath(str(src_dir or "").strip())
         raw_target = ""
         if hasattr(self, "sorter_incomplete_target_input") and is_alive(self.sorter_incomplete_target_input):
             raw_target = str(self.sorter_incomplete_target_input.text() or "").strip()
-        if not raw_target:
-            raw_target = "配对检查结果"
-        if os.path.isabs(raw_target):
-            return os.path.abspath(raw_target)
-        folder_name = self._sanitize_sort_folder_name(raw_target, fallback="配对检查结果")
-        return os.path.join(src_dir, folder_name or "配对检查结果")
+        if raw_target:
+            if os.path.isabs(raw_target):
+                return os.path.abspath(raw_target)
+            folder_name = self._sanitize_sort_folder_name(raw_target, fallback="配对检查结果")
+            return os.path.join(src_dir, folder_name or "配对检查结果")
+        if self._is_pair_status_bucket_dir(src_dir):
+            return os.path.join(os.path.dirname(src_dir), "配对检查结果")
+        if self._looks_like_pair_status_root(src_dir):
+            return src_dir
+        return os.path.join(src_dir, "配对检查结果")
+
+    def _get_pair_status_bucket_names(self):
+        return {"完整", "缺失", "需检查", "需手动检查", "手动检查"}
+
+    def _get_pair_status_root_names(self):
+        return {"配对检查结果", "配对结果", "配对结果文件夹"}
+
+    def _get_pair_status_bucket_label(self, status):
+        mapping = {
+            "complete": "完整",
+            "incomplete": "缺失",
+            "manual_review": "需检查",
+        }
+        return mapping.get(str(status or "").strip(), str(status or "").strip())
+
+    def _is_pair_status_bucket_dir(self, path):
+        try:
+            base = os.path.basename(os.path.abspath(str(path or "").strip()))
+            return base in self._get_pair_status_bucket_names()
+        except Exception:
+            return False
+
+    def _looks_like_pair_status_root(self, path):
+        try:
+            abs_path = os.path.abspath(str(path or "").strip())
+            if not abs_path or not os.path.isdir(abs_path):
+                return False
+            base = os.path.basename(abs_path)
+            if base in self._get_pair_status_root_names():
+                return True
+            for name in os.listdir(abs_path):
+                sub_path = os.path.join(abs_path, name)
+                if os.path.isdir(sub_path) and name in self._get_pair_status_bucket_names():
+                    return True
+        except Exception:
+            return False
+        return False
 
     def _resolve_pair_status_move_root(self, folder_path, src_dir, output_root=""):
         """
-        若命中的配对子目录外层父目录本身还带有 csv/图片/表格等散文件，
-        则向上提升到那个“项目根目录”整体移动，避免只搬走最深层视频子目录。
+        只按当前命中的文件夹本身处理，不再向上合并到父项目目录。
+        这样配对状态只受当前文件夹内的 txt / 视频影响，避免被上层目录或兄弟目录的额外文件干扰。
         """
-        src_dir = os.path.abspath(str(src_dir or "").strip())
         current = os.path.abspath(str(folder_path or "").strip())
-        output_root = os.path.abspath(str(output_root or "").strip()) if output_root else ""
         if not current or not os.path.isdir(current):
             return folder_path
-        while True:
-            parent = os.path.dirname(current)
-            if not parent or parent == current:
-                break
-            parent_abs = os.path.abspath(parent)
-            if parent_abs == src_dir:
-                break
-            if output_root:
-                try:
-                    if os.path.commonpath([output_root, parent_abs]) == output_root:
-                        break
-                except Exception:
-                    pass
-            if self._is_sorter_auto_managed_dir(parent_abs):
-                break
-            try:
-                direct_files = [
-                    name for name in os.listdir(parent_abs)
-                    if os.path.isfile(os.path.join(parent_abs, name)) and name != SORTER_AUTO_DIR_MARKER
-                ]
-            except Exception:
-                break
-            if not direct_files:
-                break
-            current = parent_abs
         return current
 
     def _merge_pair_status_item(self, old_item, new_item):
@@ -25728,12 +25939,13 @@ class FileManagerPro(QMainWindow):
             parts.pop(0)
         return "/".join(parts)
 
-    def _collect_pair_status_folders(self, src_dir, recursive=True, check_missing_txt=False, output_root=""):
+    def _collect_pair_status_folders(self, src_dir, recursive=True, check_missing_txt=False, output_root="", force_rescan=False):
         """
         扫描数字 txt/视频配对目录，并区分：
         - complete:      至少存在一组完整配对，且没有缺失，也没有额外未编号视频
-        - incomplete:    有缺失配对，但没有明显需要人工补判的额外视频
-        - manual_review: 存在额外未编号视频（如 未匹配-xxx、重复[...]、原始文件名视频），建议人工复核
+        - incomplete:    有缺失配对（例如 2.txt 但没有 2.mp4），且“视频总数量不足以补齐缺失”
+        - manual_review: 存在额外未编号视频（如 未匹配-xxx、重复[...]、原始文件名视频）
+                          - 若同时存在缺失配对，但视频总数足够（可能需要人工判断“多余视频”是否可补齐缺失），归入“需检查”
         返回：{"incomplete":[...], "complete":[...], "manual_review":[...]}
         """
         src_dir = os.path.abspath(str(src_dir or "").strip())
@@ -25744,19 +25956,38 @@ class FileManagerPro(QMainWindow):
         num_re = re.compile(r"^\d+$")
         video_exts = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv", ".flv", ".webm", ".ts", ".mts", ".m2ts"}
         merged_by_path = {}
+        allow_pair_status_dirs = True if force_rescan else self._looks_like_pair_status_root(src_dir)
+        effective_recursive = True if force_rescan else bool(recursive)
         try:
             for root, dirs, files in os.walk(src_dir):
                 root_abs = os.path.abspath(root)
                 if root_abs == src_dir:
-                    dirs[:] = self._filter_sort_subdirs(root, dirs, src_dir)
+                    dirs[:] = self._filter_sort_subdirs(
+                        root,
+                        dirs,
+                        src_dir,
+                        allow_pair_status_dirs=allow_pair_status_dirs,
+                        force_rescan=force_rescan,
+                    )
                     continue
 
-                dirs[:] = self._filter_sort_subdirs(root, dirs, src_dir)
-                if not recursive:
+                dirs[:] = self._filter_sort_subdirs(
+                    root,
+                    dirs,
+                    src_dir,
+                    allow_pair_status_dirs=allow_pair_status_dirs,
+                    force_rescan=force_rescan,
+                )
+                if not effective_recursive:
                     dirs[:] = []
                 if output_root:
                     try:
-                        if os.path.commonpath([output_root, root_abs]) == output_root:
+                        same_as_src_root = False
+                        try:
+                            same_as_src_root = os.path.normcase(os.path.abspath(output_root)) == os.path.normcase(os.path.abspath(src_dir))
+                        except Exception:
+                            same_as_src_root = False
+                        if (not same_as_src_root) and os.path.commonpath([output_root, root_abs]) == output_root:
                             continue
                     except Exception:
                         pass
@@ -25785,7 +26016,20 @@ class FileManagerPro(QMainWindow):
                 paired_nums = sorted(list(txt_nums & video_nums), key=lambda x: int(x))
                 missing_mp4 = sorted(list(txt_nums - video_nums), key=lambda x: int(x))
                 missing_txt = sorted(list(video_nums - txt_nums), key=lambda x: int(x)) if check_missing_txt else []
-                manual_trigger = bool(extra_videos) and bool(txt_nums)
+
+                has_txt = bool(txt_nums)
+                has_extra = bool(extra_videos)
+                has_missing = bool(missing_mp4 or missing_txt)
+                txt_count = len(txt_nums)
+                video_total_count = len(video_nums) + len(extra_videos)
+
+                if has_txt and has_extra and (not has_missing):
+                    manual_trigger = True
+                elif has_txt and has_extra and has_missing and (video_total_count >= txt_count):
+                    manual_trigger = True
+                else:
+                    manual_trigger = False
+
                 if manual_trigger:
                     item = {
                         "path": self._resolve_pair_status_move_root(root_abs, src_dir, output_root),
@@ -25803,7 +26047,7 @@ class FileManagerPro(QMainWindow):
                         "missing_mp4": missing_mp4,
                         "missing_txt": missing_txt,
                         "paired": paired_nums,
-                        "extra_videos": [],
+                        "extra_videos": sorted(extra_videos) if (has_txt and has_extra) else [],
                         "status": "incomplete",
                     }
                     merged_by_path[item["path"]] = self._merge_pair_status_item(merged_by_path.get(item["path"]), item)
@@ -25827,7 +26071,7 @@ class FileManagerPro(QMainWindow):
                 results[status].append(item)
         return results
 
-    def _collect_incomplete_pairs_folders(self, src_dir, recursive=True, check_missing_txt=False, output_root=""):
+    def _collect_incomplete_pairs_folders(self, src_dir, recursive=True, check_missing_txt=False, output_root="", force_rescan=False):
         """
         扫描“缺素材文件夹”：
         - 只认纯数字文件名：1.txt / 1.mp4
@@ -25840,6 +26084,7 @@ class FileManagerPro(QMainWindow):
             recursive=recursive,
             check_missing_txt=check_missing_txt,
             output_root=output_root,
+            force_rescan=force_rescan,
         ).get("incomplete", [])
 
     def _remove_empty_sort_dirs(self, src_dir, keep_dirs=None):
@@ -25848,6 +26093,32 @@ class FileManagerPro(QMainWindow):
         removed = []
         if not src_dir or not os.path.isdir(src_dir):
             return removed
+        for root, dirs, files in os.walk(src_dir, topdown=False):
+            root_abs = os.path.abspath(root)
+            if root_abs == src_dir:
+                continue
+            if root_abs in keep_dirs:
+                continue
+            try:
+                if os.path.isdir(root_abs) and not os.listdir(root_abs):
+                    os.rmdir(root_abs)
+                    removed.append(root_abs)
+            except Exception:
+                continue
+        return removed
+
+    def _remove_single_empty_sort_dir(self, path, keep_dirs=None):
+        path = os.path.abspath(str(path or "").strip())
+        keep_dirs = {os.path.abspath(str(p or "").strip()) for p in (keep_dirs or []) if str(p or "").strip()}
+        if not path or not os.path.isdir(path) or path in keep_dirs:
+            return False
+        try:
+            if os.listdir(path):
+                return False
+            os.rmdir(path)
+            return True
+        except Exception:
+            return False
         for root, dirs, files in os.walk(src_dir, topdown=False):
             root_abs = os.path.abspath(root)
             if root_abs == src_dir:
@@ -28081,10 +28352,22 @@ class FileManagerPro(QMainWindow):
             return os.path.normcase(os.path.abspath(str(path or "").strip()))
         except Exception:
             return os.path.normcase(str(path or "").strip())
+    def _get_sorter_auto_managed_dir_cache(self):
+        cache = getattr(self, "_sorter_auto_managed_dirs", None)
+        if not isinstance(cache, set):
+            cache = set()
+            try:
+                self._sorter_auto_managed_dirs = cache
+            except Exception:
+                pass
+        return cache
     def _is_sorter_auto_managed_dir(self, path):
         try:
             if not path or not os.path.isdir(path):
                 return False
+            norm = self._normalize_sort_dir_path(path)
+            if norm and norm in self._get_sorter_auto_managed_dir_cache():
+                return True
             return os.path.exists(os.path.join(path, SORTER_AUTO_DIR_MARKER))
         except Exception:
             return False
@@ -28092,17 +28375,66 @@ class FileManagerPro(QMainWindow):
         try:
             if not path or not os.path.isdir(path):
                 return False
-            mark_path = os.path.join(path, SORTER_AUTO_DIR_MARKER)
-            with open(mark_path, "w", encoding="utf-8") as f:
-                f.write("auto-created-by-sorter\n")
+            norm = self._normalize_sort_dir_path(path)
+            if norm:
+                self._get_sorter_auto_managed_dir_cache().add(norm)
             return True
         except Exception:
             return False
-    def _filter_sort_subdirs(self, root, dirs, src_dir=""):
+    def _clear_sorter_auto_managed_marker(self, path):
+        try:
+            if not path or not os.path.isdir(path):
+                return False
+            mark_path = os.path.join(path, SORTER_AUTO_DIR_MARKER)
+            if os.path.exists(mark_path):
+                os.remove(mark_path)
+            return True
+        except Exception:
+            return False
+    def _import_and_cleanup_sorter_markers(self, src_dir):
+        cleaned = 0
+        src_dir = os.path.abspath(str(src_dir or "").strip())
+        if not src_dir or not os.path.isdir(src_dir):
+            return cleaned
+        try:
+            for root, dirs, files in os.walk(src_dir):
+                if SORTER_AUTO_DIR_MARKER in (files or []):
+                    norm = self._normalize_sort_dir_path(root)
+                    if norm:
+                        self._get_sorter_auto_managed_dir_cache().add(norm)
+                    try:
+                        os.remove(os.path.join(root, SORTER_AUTO_DIR_MARKER))
+                        cleaned += 1
+                    except Exception:
+                        pass
+        except Exception:
+            return cleaned
+        return cleaned
+    def _cleanup_sorter_markers_for_paths(self, paths):
+        cleaned = 0
+        seen = set()
+        for path in paths or []:
+            norm = self._normalize_sort_dir_path(path)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            try:
+                if self._clear_sorter_auto_managed_marker(path):
+                    cleaned += 1
+            except Exception:
+                pass
+        return cleaned
+    def _filter_sort_subdirs(self, root, dirs, src_dir="", allow_pair_status_dirs=False, force_rescan=False):
         kept = []
         for d in dirs or []:
             cand = os.path.join(root, d)
             if self._is_sorter_auto_managed_dir(cand):
+                if force_rescan:
+                    kept.append(d)
+                    continue
+                if allow_pair_status_dirs and self._is_pair_status_bucket_dir(cand):
+                    kept.append(d)
+                    continue
                 continue
             kept.append(d)
         return kept
@@ -28186,6 +28518,12 @@ class FileManagerPro(QMainWindow):
     def run_sorting(self):
         src_dir = self.sorter_path_input.text().strip()
         if not src_dir or not os.path.exists(src_dir): QMessageBox.warning(self, "提示", "源目录不存在"); return
+        try:
+            cleaned_marker_count = self._import_and_cleanup_sorter_markers(src_dir)
+            if cleaned_marker_count:
+                self.log(f"已自动清理 {cleaned_marker_count} 个旧的分类标记文件。", "blue")
+        except Exception:
+            pass
         mode = self._get_sorter_mode()
         if mode == "flatten_to_root":
             flatten_files = self._collect_flatten_sort_files(src_dir, recursive=self.recursive_check.isChecked())
@@ -28263,28 +28601,30 @@ class FileManagerPro(QMainWindow):
                 self.log(f"当前模式【{self._get_sorter_mode_label(mode)}】下未发现可移动的文件", "orange")
             return
         if mode == "extract_incomplete_pairs":
-            recursive = self.recursive_check.isChecked() if hasattr(self, "recursive_check") and is_alive(self.recursive_check) else False
+            recursive = True
             keep_structure = self.sorter_incomplete_keep_structure_check.isChecked() if hasattr(self, "sorter_incomplete_keep_structure_check") and is_alive(self.sorter_incomplete_keep_structure_check) else True
             check_missing_txt = self.sorter_incomplete_check_missing_txt_check.isChecked() if hasattr(self, "sorter_incomplete_check_missing_txt_check") and is_alive(self.sorter_incomplete_check_missing_txt_check) else False
+            force_rescan = True
             target_dir = self._resolve_incomplete_pairs_target_dir(src_dir)
             pair_groups = self._collect_pair_status_folders(
                 src_dir,
                 recursive=recursive,
                 check_missing_txt=check_missing_txt,
                 output_root=target_dir,
+                force_rescan=force_rescan,
             )
             incomplete_items = pair_groups.get("incomplete", []) or []
             complete_items = pair_groups.get("complete", []) or []
             manual_review_items = pair_groups.get("manual_review", []) or []
             if not incomplete_items and not complete_items and not manual_review_items:
-                self.log(f"当前模式【{self._get_sorter_mode_label(mode)}】下没有发现可提取的配对文件夹", "orange")
+                self.log(f"当前模式【{self._get_sorter_mode_label(mode)}】已强制重扫当前范围，但没有发现可归类的配对文件夹", "orange")
                 return
 
             # 预览提示：展示前若干项
             preview_lines = []
             preview_items = (
                 [dict(it, _preview_status="缺失") for it in incomplete_items[:6]]
-                + [dict(it, _preview_status="手动检查") for it in manual_review_items[:6]]
+                + [dict(it, _preview_status="需检查") for it in manual_review_items[:6]]
                 + [dict(it, _preview_status="完整") for it in complete_items[:6]]
             )
             for it in preview_items:
@@ -28309,21 +28649,21 @@ class FileManagerPro(QMainWindow):
                 preview_lines.append(f"- [{it.get('_preview_status', '缺失')}] {rel}（{'；'.join(note_parts)}）")
             total_items = len(incomplete_items) + len(complete_items) + len(manual_review_items)
             more_hint = f"\n... 还有 {total_items - len(preview_items)} 个未展示" if total_items > len(preview_items) else ""
-            scope_text = "所有层级子文件夹" if recursive else "直接子文件夹"
+            scope_text = "所有层级子文件夹（强制重扫）" if force_rescan else ("所有层级子文件夹" if recursive else "直接子文件夹")
             keep_text = "保持原结构" if keep_structure else "仅保留文件夹名"
             incomplete_dir = os.path.join(target_dir, "缺失")
-            manual_review_dir = os.path.join(target_dir, "需手动检查")
+            manual_review_dir = os.path.join(target_dir, "需检查")
             complete_dir = os.path.join(target_dir, "完整")
             confirm = QMessageBox.question(
                 self,
                 "确认提取配对文件夹",
                 f"将从{scope_text}中整理 {total_items} 个文件夹：\n"
                 f"- 缺失：{len(incomplete_items)} 个 → {incomplete_dir}\n"
-                f"- 需手动检查：{len(manual_review_items)} 个 → {manual_review_dir}\n"
+                f"- 需检查：{len(manual_review_items)} 个 → {manual_review_dir}\n"
                 f"- 完整：{len(complete_items)} 个 → {complete_dir}\n\n方式：{keep_text}\n\n示例：\n"
                 + "\n".join(preview_lines)
                 + more_hint
-                + "\n\n会把命中的原项目文件夹整体搬走，文件夹里的 csv、图片、表格等文件会跟着一起移动；最终只保留“完整 / 缺失 / 需手动检查”三个结果目录。\n\n是否继续？"
+                + "\n\n每次执行都会把当前范围内已有的“完整 / 缺失 / 需检查”结果重新洗牌归并，最终只保留一层结果目录，不会再出现里面套一层同名目录。\n\n是否继续？"
             )
             accepted_yes = QMessageBox.StandardButton.Yes if PYQT_VERSION == 6 else QMessageBox.Yes
             if confirm != accepted_yes:
@@ -28353,6 +28693,7 @@ class FileManagerPro(QMainWindow):
                 return
 
             count = 0
+            stable_count = 0
             history = []
             failures = []
             skipped = 0
@@ -28361,7 +28702,7 @@ class FileManagerPro(QMainWindow):
             moved_complete = 0
             for status_key, bucket_dir, items in (
                 ("缺失", incomplete_dir, incomplete_items),
-                ("手动检查", manual_review_dir, manual_review_items),
+                ("需检查", manual_review_dir, manual_review_items),
                 ("完整", complete_dir, complete_items),
             ):
                 for it in items:
@@ -28391,6 +28732,20 @@ class FileManagerPro(QMainWindow):
                         os.makedirs(os.path.dirname(target_path), exist_ok=True)
                     except Exception:
                         pass
+                    same_target = False
+                    try:
+                        same_target = os.path.abspath(target_path) == os.path.abspath(folder_path)
+                    except Exception:
+                        same_target = False
+                    if same_target:
+                        stable_count += 1
+                        if status_key == "缺失":
+                            moved_incomplete += 1
+                        elif status_key == "需检查":
+                            moved_manual_review += 1
+                        else:
+                            moved_complete += 1
+                        continue
                     target_path = _pick_nonconflict_path(target_path)
                     try:
                         shutil.move(folder_path, target_path)
@@ -28398,7 +28753,7 @@ class FileManagerPro(QMainWindow):
                         count += 1
                         if status_key == "缺失":
                             moved_incomplete += 1
-                        elif status_key == "手动检查":
+                        elif status_key == "需检查":
                             moved_manual_review += 1
                         else:
                             moved_complete += 1
@@ -28406,7 +28761,7 @@ class FileManagerPro(QMainWindow):
                         failures.append((folder_path, target_path, f"{status_key}: {e}"))
 
             removed_empty_dirs = []
-            # 关键：移动完“配对文件夹”后，把源目录里因此产生的空父级目录也清掉，避免残留空壳文件夹
+            removed_source_root = False
             if count > 0:
                 try:
                     removed_empty_dirs = self._remove_empty_sort_dirs(
@@ -28415,15 +28770,27 @@ class FileManagerPro(QMainWindow):
                     )
                 except Exception:
                     removed_empty_dirs = []
+                try:
+                    removed_source_root = self._remove_single_empty_sort_dir(
+                        src_dir,
+                        keep_dirs=[target_dir, incomplete_dir, manual_review_dir, complete_dir],
+                    )
+                except Exception:
+                    removed_source_root = False
 
-            if count > 0:
-                self.last_sort_history = history
-                self.btn_undo_sort.setEnabled(True)
-                detail_parts = [f"提取文件夹 {count}", f"缺失 {moved_incomplete}", f"手动检查 {moved_manual_review}", f"完整 {moved_complete}"]
+            if count > 0 or stable_count > 0:
+                if history:
+                    self.last_sort_history = history
+                    self.btn_undo_sort.setEnabled(True)
+                detail_parts = [f"处理文件夹 {count + stable_count}", f"缺失 {moved_incomplete}", f"需检查 {moved_manual_review}", f"完整 {moved_complete}"]
+                if stable_count:
+                    detail_parts.append(f"原位保留 {stable_count}")
                 if skipped:
                     detail_parts.append(f"跳过 {skipped}")
                 if removed_empty_dirs:
                     detail_parts.append(f"删除空文件夹 {len(removed_empty_dirs)}")
+                if removed_source_root:
+                    detail_parts.append("删除旧结果根目录 1")
                 self.log(f"分类完成，模式：{self._get_sorter_mode_label(mode)}（{'，'.join(detail_parts)}）", "green")
                 if failures:
                     self.log(f"⚠️ 另有 {len(failures)} 个项目移动失败（常见原因：文件被占用/无权限）。", "orange")
@@ -28437,7 +28804,7 @@ class FileManagerPro(QMainWindow):
                     except Exception:
                         pass
             else:
-                self.log(f"当前模式【{self._get_sorter_mode_label(mode)}】下未发现可移动的文件夹", "orange")
+                self.log(f"当前模式【{self._get_sorter_mode_label(mode)}】下未发现可处理的文件夹", "orange")
             return
         rules = self._collect_sorter_rules()
         if mode == "custom_rule" and not rules:
