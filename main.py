@@ -25907,7 +25907,7 @@ class FileManagerPro(QMainWindow):
     def _resolve_pair_status_move_root(self, folder_path, src_dir, output_root=""):
         """
         只按当前命中的文件夹本身处理，不再向上合并到父项目目录。
-        这样配对状态只受当前文件夹内的 txt / 视频影响，避免被上层目录或兄弟目录的额外文件干扰。
+        配对目录之外遗留的其它文件，会在提取结束后再统一补搬到“完整”目录。
         """
         current = os.path.abspath(str(folder_path or "").strip())
         if not current or not os.path.isdir(current):
@@ -26087,6 +26087,63 @@ class FileManagerPro(QMainWindow):
             force_rescan=force_rescan,
         ).get("incomplete", [])
 
+    def _move_remaining_pair_aux_files_to_complete(self, src_dir, complete_dir, output_root="", keep_structure=True):
+        """
+        配对提取完成后，把源目录里剩余的“非 txt / 非视频”文件统一补搬到“完整”目录。
+        这样像 csv / xlsx / json / 封面图 / 配置文件 不会遗留在原位置，也不会被分散到缺失/需检查目录。
+        """
+        src_dir = os.path.abspath(str(src_dir or "").strip())
+        complete_dir = os.path.abspath(str(complete_dir or "").strip())
+        output_root = os.path.abspath(str(output_root or "").strip()) if output_root else ""
+        moved = []
+        failures = []
+        if not src_dir or not complete_dir or (not os.path.isdir(src_dir)):
+            return moved, failures
+        video_exts = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv", ".flv", ".webm", ".ts", ".mts", ".m2ts"}
+        try:
+            for root, dirs, files in os.walk(src_dir):
+                dirs[:] = self._filter_sort_subdirs(
+                    root,
+                    dirs,
+                    src_dir,
+                    allow_pair_status_dirs=False,
+                    force_rescan=False,
+                )
+                root_abs = os.path.abspath(root)
+                if output_root:
+                    try:
+                        if os.path.commonpath([output_root, root_abs]) == output_root:
+                            continue
+                    except Exception:
+                        pass
+                for fname in files or []:
+                    src_path = os.path.abspath(os.path.join(root_abs, fname))
+                    ext = os.path.splitext(str(fname or ""))[1].lower().strip()
+                    if ext == ".txt" or ext in video_exts:
+                        continue
+                    try:
+                        rel = os.path.relpath(src_path, src_dir) if keep_structure else os.path.basename(src_path)
+                    except Exception:
+                        rel = os.path.basename(src_path)
+                    rel = self._normalize_pair_sort_rel_path(rel)
+                    rel = rel.strip().lstrip("\\/") if rel else os.path.basename(src_path)
+                    if not rel:
+                        rel = os.path.basename(src_path)
+                    dst_path = os.path.join(complete_dir, rel)
+                    try:
+                        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        resolved_dst = _pick_nonconflict_path(dst_path)
+                        shutil.move(src_path, resolved_dst)
+                        moved.append((src_path, resolved_dst))
+                    except Exception as e:
+                        failures.append((src_path, dst_path, f"完整: {e}"))
+        except Exception as e:
+            failures.append((src_dir, complete_dir, f"完整: {e}"))
+        return moved, failures
+
     def _remove_empty_sort_dirs(self, src_dir, keep_dirs=None):
         src_dir = os.path.abspath(str(src_dir or "").strip())
         keep_dirs = [os.path.abspath(str(p or "").strip()) for p in (keep_dirs or []) if str(p or "").strip()]
@@ -26119,19 +26176,6 @@ class FileManagerPro(QMainWindow):
             return True
         except Exception:
             return False
-        for root, dirs, files in os.walk(src_dir, topdown=False):
-            root_abs = os.path.abspath(root)
-            if root_abs == src_dir:
-                continue
-            if root_abs in keep_dirs:
-                continue
-            try:
-                if os.path.isdir(root_abs) and not os.listdir(root_abs):
-                    os.rmdir(root_abs)
-                    removed.append(root_abs)
-            except Exception:
-                continue
-        return removed
 
     def _deep_link_help_text(self):
         return (
@@ -28697,6 +28741,7 @@ class FileManagerPro(QMainWindow):
             history = []
             failures = []
             skipped = 0
+            aux_file_count = 0
             moved_incomplete = 0
             moved_manual_review = 0
             moved_complete = 0
@@ -28760,9 +28805,27 @@ class FileManagerPro(QMainWindow):
                     except Exception as e:
                         failures.append((folder_path, target_path, f"{status_key}: {e}"))
 
+            aux_history = []
+            aux_failures = []
+            try:
+                aux_history, aux_failures = self._move_remaining_pair_aux_files_to_complete(
+                    src_dir,
+                    complete_dir,
+                    output_root=target_dir,
+                    keep_structure=keep_structure,
+                )
+            except Exception as e:
+                aux_failures = [(src_dir, complete_dir, f"完整: {e}")]
+            if aux_history:
+                history.extend(aux_history)
+                aux_file_count = len(aux_history)
+                moved_complete += aux_file_count
+            if aux_failures:
+                failures.extend(aux_failures)
+
             removed_empty_dirs = []
             removed_source_root = False
-            if count > 0:
+            if count > 0 or aux_file_count > 0:
                 try:
                     removed_empty_dirs = self._remove_empty_sort_dirs(
                         src_dir,
@@ -28778,11 +28841,13 @@ class FileManagerPro(QMainWindow):
                 except Exception:
                     removed_source_root = False
 
-            if count > 0 or stable_count > 0:
+            if count > 0 or stable_count > 0 or aux_file_count > 0:
                 if history:
                     self.last_sort_history = history
                     self.btn_undo_sort.setEnabled(True)
                 detail_parts = [f"处理文件夹 {count + stable_count}", f"缺失 {moved_incomplete}", f"需检查 {moved_manual_review}", f"完整 {moved_complete}"]
+                if aux_file_count:
+                    detail_parts.append(f"补搬其它文件 {aux_file_count}")
                 if stable_count:
                     detail_parts.append(f"原位保留 {stable_count}")
                 if skipped:
