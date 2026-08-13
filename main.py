@@ -9095,6 +9095,10 @@ class VideoCopyMatchThread(QThread):
         self.separate_by_subfolder = bool(separate_by_subfolder)
         self.skip_existing_pairs = bool(skip_existing_pairs)
         self.media_roots = collect_existing_input_roots(video_input)
+        # faster-whisper 模型实例必须在同一任务内复用；逐文件重复初始化会造成
+        # CTranslate2 反复申请资源，并可能在不完整 CUDA 环境中卡在初始化阶段。
+        self._asr_model = None
+        self._asr_model_spec = None
 
     def _collect_media_files(self, path_input):
         files = []
@@ -9584,19 +9588,55 @@ class VideoCopyMatchThread(QThread):
             pass
         return None
 
+    def _asr_cuda_available(self):
+        """只在 Torch 明确识别到可用 CUDA 时才让 faster-whisper 尝试 GPU。"""
+        if not self.clip_use_gpu:
+            return False
+        try:
+            import torch
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    def _get_faster_whisper_model(self, WhisperModel, model_name, device, compute_type):
+        """按“模型+设备+精度”缓存模型，避免每个文件重复初始化 CTranslate2。"""
+        spec = (str(model_name), str(device), str(compute_type))
+        if self._asr_model is not None and self._asr_model_spec == spec:
+            self.log.emit(
+                f"[音频转写] 复用已加载的 Whisper {model_name} ({device})。",
+                "gray"
+            )
+            return self._asr_model
+        self.log.emit(
+            f"[音频转写] 正在加载本地 Whisper {model_name} ({device}) ...",
+            "blue"
+        )
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        self._asr_model = model
+        self._asr_model_spec = spec
+        self.log.emit(
+            f"[音频转写] Whisper {model_name} 初始化完成 ({device})。",
+            "green"
+        )
+        return model
+
     def _transcribe_with_faster_whisper(self, audio_path):
         try:
             from faster_whisper import WhisperModel
         except Exception as e:
             raise RuntimeError(f"未安装 faster-whisper：{e}")
 
-        last_err = None
         local_model_name = str(self.ai_config.get("audio_transcribe_local_model", "small") or "small").strip() or "small"
-        for device, compute_type in ([("cuda", "float16"), ("cpu", "int8")] if self.clip_use_gpu else [("cpu", "int8")]):
+        # 不要把“CLIP 启用 GPU”直接当作 ASR 可用 GPU。日志已显示 Torch 未检测到 CUDA，
+        # 此处应只走 CPU，从根源避免第二个文件再次卡在 CUDA 初始化。
+        candidates = [("cuda", "float16"), ("cpu", "int8")] if self._asr_cuda_available() else [("cpu", "int8")]
+        last_err = None
+        for device, compute_type in candidates:
             try:
-                self.log.emit(f"[音频转写] 正在加载本地 Whisper {local_model_name} ({device}) ...", "blue")
-                model = WhisperModel(local_model_name, device=device, compute_type=compute_type)
-                raw_segments, info = model.transcribe(
+                model = self._get_faster_whisper_model(
+                    WhisperModel, local_model_name, device, compute_type
+                )
+                raw_segments, _info = model.transcribe(
                     audio_path,
                     vad_filter=True,
                     beam_size=5,
@@ -9632,7 +9672,12 @@ class VideoCopyMatchThread(QThread):
                 }
             except Exception as e:
                 last_err = e
+                # 初始化失败时不要保留半初始化实例，允许后续候选设备正常回退。
+                self._asr_model = None
+                self._asr_model_spec = None
+                self.log.emit(f"[音频转写] {device} 不可用，准备回退：{e}", "orange")
         raise RuntimeError(f"faster-whisper 转写失败：{last_err}")
+
 
     def _transcribe_with_api(self, audio_path):
         profile = get_primary_api_profile(self.ai_config)
@@ -23208,6 +23253,13 @@ class FileManagerPro(QMainWindow):
         self.uni_match_thread.progress.connect(self.uni_progress_bar.setValue); self.uni_match_thread.log.connect(self.log); self.uni_match_thread.result.connect(self.display_universal_match_results); self.uni_match_thread.start()
 
     def run_video_copy_match(self):
+        # 避免连续点击或与其他音频任务并行执行；它们都会各自初始化 Whisper，
+        # 在 CPU / CUDA 回退状态下容易出现资源争用与界面看似“卡住”的情况。
+        for attr in ("uni_copy_match_thread", "uni_srt_export_thread", "uni_txt_export_thread"):
+            running_thread = getattr(self, attr, None)
+            if running_thread is not None and running_thread.isRunning():
+                self.log("[音频文案匹配] 当前已有音频任务正在运行，请等待其完成后再启动。", "orange")
+                return
         src = self.uni_match_src_input.text().strip()
         res = self.uni_match_res_input.text().strip()
         raw_copy = self.uni_match_copy_edit.toPlainText().strip() if hasattr(self, "uni_match_copy_edit") else ""
