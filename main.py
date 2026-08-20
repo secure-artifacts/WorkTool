@@ -907,7 +907,7 @@ try:
     from PyQt6.QtCore import pyqtSlot, QMetaObject, Q_ARG, Qt, QSize, QThread, pyqtSignal, QPoint, QTimer, QMimeData, QUrl, QRect, QRectF, QEvent, QEventLoop, QObject, QItemSelectionModel
     from PyQt6.QtGui import (
         QTextCharFormat, QFont, QColor, QTextCursor, QPixmap, QImage,
-        QPainter, QPen, QBrush, QTextTableFormat, QTextLength, QIcon, QDrag, QFontDatabase, QFontMetrics, QCursor, QDesktopServices, QPainterPath, QTransform
+        QPainter, QPen, QBrush, QTextTableFormat, QTextLength, QIcon, QDrag, QFontDatabase, QFontMetrics, QCursor, QDesktopServices, QPainterPath, QTransform, QPalette
     )
     PYQT_VERSION = 6
     _AlignCenter = Qt.AlignmentFlag.AlignCenter if PYQT_VERSION == 6 else Qt.AlignCenter
@@ -964,7 +964,7 @@ except ImportError:
     from PyQt5.QtCore import pyqtSlot, QMetaObject, Q_ARG, Qt, QSize, QThread, pyqtSignal, QPoint, QTimer, QMimeData, QUrl, QRect, QRectF, QEvent, QEventLoop, QObject, QItemSelectionModel
     from PyQt5.QtGui import (
         QTextCharFormat, QFont, QColor, QTextCursor, QPixmap, QImage,
-        QPainter, QPen, QBrush, QTextTableFormat, QTextLength, QIcon, QDrag, QFontDatabase, QFontMetrics, QCursor, QDesktopServices, QPainterPath, QTransform
+        QPainter, QPen, QBrush, QTextTableFormat, QTextLength, QIcon, QDrag, QFontDatabase, QFontMetrics, QCursor, QDesktopServices, QPainterPath, QTransform, QPalette
     )
     PYQT_VERSION = 5
     _AlignCenter = Qt.AlignmentFlag.AlignCenter if PYQT_VERSION == 6 else Qt.AlignCenter
@@ -1007,6 +1007,120 @@ except ImportError:
     def is_alive(obj):
         try: return not obj.wasDeleted() if hasattr(obj, "wasDeleted") else True
         except: return False
+
+def apply_consistent_light_theme(app):
+    """使用独立亮色调色板，避免系统深色主题导致未显式着色的文字不可见。"""
+    try:
+        app.setStyle("Fusion")
+    except Exception:
+        pass
+
+    try:
+        roles = QPalette.ColorRole if PYQT_VERSION == 6 else QPalette
+        palette = QPalette()
+        colors = {
+            "Window": "#f8fafc", "WindowText": "#111827", "Base": "#ffffff",
+            "AlternateBase": "#f1f5f9", "ToolTipBase": "#ffffff", "ToolTipText": "#111827",
+            "Text": "#111827", "Button": "#f8fafc", "ButtonText": "#111827",
+            "BrightText": "#ffffff", "Highlight": "#2563eb", "HighlightedText": "#ffffff",
+            "Link": "#1d4ed8",
+        }
+        for role_name, color in colors.items():
+            palette.setColor(getattr(roles, role_name), QColor(color))
+        app.setPalette(palette)
+    except Exception as exc:
+        try:
+            write_debug(f"亮色主题调色板应用失败: {exc}")
+        except Exception:
+            pass
+
+    # 明确设置常用控件的前景色；局部样式若未声明颜色，也会继承此处的高对比度设置。
+    app.setStyleSheet("""
+        QWidget { color: #111827; }
+        QMainWindow, QDialog { background-color: #f8fafc; }
+        QLabel { color: #111827; background-color: transparent; }
+        QLineEdit, QTextEdit, QTextBrowser, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
+        QComboBox, QListWidget, QTableWidget, QTreeWidget {
+            color: #111827; background-color: #ffffff; border: 1px solid #cbd5e1;
+        }
+        QLineEdit:disabled, QTextEdit:disabled, QComboBox:disabled, QPushButton:disabled,
+        QCheckBox:disabled, QRadioButton:disabled, QLabel:disabled { color: #6b7280; }
+        QComboBox QAbstractItemView, QMenu {
+            color: #111827; background-color: #ffffff; selection-background-color: #dbeafe;
+            selection-color: #111827;
+        }
+        QTableWidget::item { color: #111827; }
+        QHeaderView::section {
+            color: #111827; background-color: #e2e8f0; border: 1px solid #cbd5e1;
+        }
+        QPushButton, QToolButton {
+            color: #111827; background-color: #f8fafc; border: 1px solid #94a3b8;
+            padding: 4px 8px; border-radius: 4px;
+        }
+        QPushButton:hover, QToolButton:hover { background-color: #e2e8f0; }
+        QTabBar::tab { color: #111827; background-color: #e2e8f0; padding: 7px 12px; }
+        QTabBar::tab:selected { background-color: #ffffff; color: #0f172a; }
+        QToolTip { color: #111827; background-color: #ffffff; border: 1px solid #64748b; }
+    """)
+
+
+def restore_window_geometry_safely(window, geometry, default_size=(1280, 820), min_visible_width=240, min_visible_height=160):
+    """恢复窗口时校验其至少有一部分位于当前连接的显示器可用区域内。"""
+    if not isinstance(geometry, (list, tuple)) or len(geometry) != 4:
+        return False
+    try:
+        x, y, width, height = [int(value) for value in geometry]
+    except (TypeError, ValueError):
+        return False
+    if width <= 0 or height <= 0:
+        return False
+
+    try:
+        screens = QApplication.screens()
+        primary_screen = QApplication.primaryScreen()
+    except Exception:
+        return False
+    if not screens or primary_screen is None:
+        return False
+
+    saved_rect = QRect(x, y, max(1, width), max(1, height))
+    target_screen = None
+    largest_area = 0
+    for screen in screens:
+        available = screen.availableGeometry()
+        overlap = saved_rect.intersected(available)
+        overlap_area = max(0, overlap.width()) * max(0, overlap.height())
+        if (overlap.width() >= min_visible_width and overlap.height() >= min_visible_height
+                and overlap_area > largest_area):
+            target_screen = screen
+            largest_area = overlap_area
+
+    # 已移除的副屏会使旧坐标完全落在当前桌面之外；此时回退到主屏幕中央。
+    if target_screen is None:
+        target_screen = primary_screen
+        center_on_screen = True
+    else:
+        center_on_screen = False
+
+    available = target_screen.availableGeometry()
+    min_width = min(max(1, default_size[0] // 2), available.width())
+    min_height = min(max(1, default_size[1] // 2), available.height())
+    width = max(min_width, min(width, available.width()))
+    height = max(min_height, min(height, available.height()))
+
+    if center_on_screen:
+        x = available.left() + max(0, (available.width() - width) // 2)
+        y = available.top() + max(0, (available.height() - height) // 2)
+    else:
+        x = max(available.left(), min(x, available.right() - width + 1))
+        y = max(available.top(), min(y, available.bottom() - height + 1))
+
+    try:
+        window.setGeometry(x, y, width, height)
+        return True
+    except Exception:
+        return False
+
 
 try:
     _prepare_vlc_runtime(log_if_missing=False)
@@ -30306,9 +30420,9 @@ class FileManagerPro(QMainWindow):
 
             if cfg.get("global_pin"): self.global_pin_check.setChecked(True)
             m_geom = cfg.get("main_window_geom")
-            if m_geom and len(m_geom) == 4:
-                self.move(m_geom[0], m_geom[1])
-                self.resize(m_geom[2], m_geom[3])
+            # 显示器数量或排列变化后，旧坐标可能落到已不存在的副屏；统一回退到可见区域。
+            if m_geom:
+                restore_window_geometry_safely(self, m_geom)
             try:
                 wm_cfg = cfg.get("watermark_config")
                 if wm_cfg: self.watermark_tab.load_config(wm_cfg)
@@ -31164,6 +31278,7 @@ if __name__ == "__main__":
             QApplication.setAttribute(Qt.AA_UseSoftwareOpenGL)
         
         app = QApplication(sys.argv)
+        apply_consistent_light_theme(app)
         app.setWindowIcon(make_app_icon())
         emergency_log("QApplication 实例已创建")
         write_debug("QApplication 实例已创建")
